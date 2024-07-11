@@ -211,7 +211,8 @@ typedef enum {
     STATE_READY,
     STATE_BINDING,
     STATE_SEARCHING,
-    STATE_COMPARING
+    STATE_COMPARING,
+    STATE_DISCONNECTING
 } ngx_http_auth_ldap_connection_state_t;
 
 typedef struct ngx_http_auth_ldap_connection {
@@ -1369,8 +1370,19 @@ ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c, int retr
 {
     ngx_queue_t *q;
     ngx_msec_t reconnect_delay = retry_asap ? RECONNECT_ASAP_MS : c->server->reconnect_timeout; // Default reconnect delay
+    ngx_http_auth_ldap_connection_state_t saved_state;
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0, "ngx_http_auth_ldap_close_connection: Cnx[%d] retry_asap=%d", c->cnx_idx, retry_asap);
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, c->log, 0, "ngx_http_auth_ldap_close_connection: Cnx[%d] retry_asap=%d state=%d", c->cnx_idx, retry_asap, c->state);
+
+    if (c->state == STATE_DISCONNECTING) {
+        // Already in DISCONNECTING state. break here to avoid recuse in ngx_http_auth_ldap_close_connection
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "ngx_http_auth_ldap_close_connection: Cnx[%d] Already in DISCONNECTING state", c->cnx_idx);
+        return;
+    }
+    
+    // Temporary DISCONNECTING state to avoid loops in ngx_http_auth_ldap_close_connection
+    saved_state = c->state;
+    c->state = STATE_DISCONNECTING;
 
     if (c->ld) {
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0, "ngx_http_auth_ldap_close_connection: Cnx[%d] Unbinding from the server \"%V\")",
@@ -1411,6 +1423,7 @@ ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c, int retr
     }
 
     c->rctx = NULL;
+    c->state = saved_state; // Restore initial state
     if (c->state != STATE_DISCONNECTED) {
         c->state = STATE_DISCONNECTED;
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
