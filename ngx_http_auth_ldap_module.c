@@ -2794,6 +2794,13 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
     u_char *filter;
     ngx_int_t rc;
 
+    /* First ensure we have a valid LDAP connection */
+    if (ctx->c == NULL || ctx->c->ld == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "LDAP connection not established");
+        return NGX_ERROR;
+    }
+
     /* On the first call, initiate the LDAP search operation */
     if (ctx->iteration == 0) {
         if (!ngx_http_auth_ldap_get_connection(ctx)) {
@@ -2805,46 +2812,68 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
             r->pool,
             (ludpp->lud_filter != NULL ? ngx_strlen(ludpp->lud_filter) : ngx_strlen("(objectClass=*)")) +
             ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + r->headers_in.user.len + 1);
-        ngx_sprintf(filter, "(&%s(%s=%V))%Z",
-                ludpp->lud_filter != NULL ? ludpp->lud_filter : "(objectClass=*)",
-                ludpp->lud_attrs[0], &r->headers_in.user);
-        ngx_log_error(NGX_LOG_INFO, ctx->c->log, 0, "ngx_http_auth_ldap_search: Cnx[%d] Searching (with filter \"%s\") ...",
-            ctx->c->cnx_idx, (const char *) filter);
 
-        rc = ldap_search_ext(ctx->c->ld, ludpp->lud_dn, ludpp->lud_scope, (const char *) filter, ctx->server->attrs, 0, NULL, NULL, NULL, 0, &ctx->c->msgid);
-        if (rc != LDAP_SUCCESS) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "ngx_http_auth_ldap_search: ldap_search_ext() Cnx[%d] failed (%d, %s)",
-                ctx->c->cnx_idx, rc, ldap_err2string(rc));
-            ngx_http_auth_ldap_return_connection(ctx->c);
+        if (filter == NULL) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "Failed to allocate memory for LDAP filter");
             return NGX_ERROR;
         }
 
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "ngx_http_auth_ldap_search: ldap_search_ext() Cnx[%d] -> msgid=%d",
-            ctx->c->cnx_idx, ctx->c->msgid);
+        ngx_sprintf(filter, "(&%s(%s=%V))%Z",
+                ludpp->lud_filter != NULL ? ludpp->lud_filter : "(objectClass=*)",
+                ludpp->lud_attrs[0], &r->headers_in.user);
+
+        ngx_log_error(NGX_LOG_DEBUG, ctx->c->log, 0,
+                     "LDAP search filter: %s", filter);
+
+        rc = ldap_search_ext(ctx->c->ld, ludpp->lud_dn, ludpp->lud_scope,
+                           (const char *) filter, ctx->server->attrs,
+                           0, NULL, NULL, NULL, 0, &ctx->c->msgid);
+
+        if (rc != LDAP_SUCCESS) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                         "ldap_search_ext() failed: %s (%d)",
+                         ldap_err2string(rc), rc);
+
+            /* Try to reconnect if the error is connection-related */
+            if (rc == LDAP_SERVER_DOWN || rc == LDAP_CONNECT_ERROR) {
+                ngx_http_auth_ldap_close_connection(ctx->c, 1);
+            }
+
+            return NGX_ERROR;
+        }
+
         ctx->c->state = STATE_SEARCHING;
         ctx->iteration++;
         return NGX_AGAIN;
     }
 
-    /* On the second call, handle the search results */
+    /* Handle search results */
     if (ctx->error_code != LDAP_SUCCESS) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "ngx_http_auth_ldap_search: ldap_search_ext() Cnx[%d] request failed (%d: %s)",
-            ctx->c->cnx_idx, ctx->error_code, ldap_err2string(ctx->error_code));
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                     "LDAP search failed: %s (%d)",
+                     ctx->error_msg.data ? (char *)ctx->error_msg.data : ldap_err2string(ctx->error_code),
+                     ctx->error_code);
         return NGX_ERROR;
     }
 
     if (ctx->dn.data == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "ngx_http_auth_ldap_search: Cnx[%d] Could not find user DN", ctx->c->cnx_idx);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                     "User not found in LDAP directory");
         return NGX_ERROR;
-    } else {
-        ngx_log_error(NGX_LOG_INFO, ctx->c->log, 0, "ngx_http_auth_ldap_search: Cnx[%d] Found dn: \"%s\")",
-            ctx->c->cnx_idx, ctx->dn.data);
-        ctx->user_dn.len = ngx_strlen(ctx->dn.data);
-        ctx->user_dn.data = (u_char *) ngx_palloc(ctx->r->pool, ctx->user_dn.len + 1);
-        ngx_memcpy(ctx->user_dn.data, ctx->dn.data, ctx->user_dn.len + 1);
-        ctx->dn.data = NULL;
-        ctx->dn.len = 0;
     }
+
+    /* Search successful, proceed with user DN */
+    ctx->user_dn.len = ctx->dn.len;
+    ctx->user_dn.data = ngx_palloc(ctx->r->pool, ctx->user_dn.len + 1);
+    if (ctx->user_dn.data == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_memcpy(ctx->user_dn.data, ctx->dn.data, ctx->user_dn.len);
+    ctx->user_dn.data[ctx->user_dn.len] = '\0';
+
+    ctx->dn.data = NULL;
+    ctx->dn.len = 0;
 
     return NGX_OK;
 }
