@@ -1471,57 +1471,36 @@ ngx_http_auth_ldap_wake_request(ngx_http_request_t *r)
     ngx_http_core_run_phases(r);
 }
 
-static int
-ngx_http_auth_ldap_get_connection(ngx_http_auth_ldap_ctx_t *ctx)
-{
-    ngx_http_auth_ldap_server_t *server;
-    ngx_queue_t *q;
-    ngx_http_auth_ldap_connection_t *c;
+static ngx_int_t
+ngx_http_auth_ldap_get_connection(ngx_http_auth_ldap_ctx_t *ctx) {
+    ngx_http_auth_ldap_server_t *server = ctx->server;
 
-    /*
-     * If we already have a connection, just say we got them one.
-     */
-    if (ctx->c != NULL)
-        return 1;
+    if (ctx->c != NULL && ctx->c->ld != NULL) {
+        return 1;  // Existing connection is good
+    }
 
-    server = ctx->server;
-
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->r->connection->log, 0,
-        "ngx_http_auth_ldap_get_connection: Wants a free connection to \"%V\"", &server->alias);
-
+    // Original queue management logic
     if (!ngx_queue_empty(&server->free_connections)) {
-        q = ngx_queue_last(&server->free_connections);
+        ngx_queue_t *q = ngx_queue_last(&server->free_connections);
         ngx_queue_remove(q);
-        c = ngx_queue_data(q, ngx_http_auth_ldap_connection_t, queue);
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->r->connection->log, 0,
-            "ngx_http_auth_ldap_get_connection: Got cnx [%d] from free queue", c->cnx_idx);
-        c->rctx = ctx;
-        ctx->c = c;
-        ctx->replied = 0;
+        ctx->c = ngx_queue_data(q, ngx_http_auth_ldap_connection_t, queue);
+        ctx->c->rctx = ctx;
         return 1;
     }
 
-    /* Check if we have pending (waiting reconnect) connection */
+    // Original reconnection logic
     if (!ngx_queue_empty(&server->pending_reconnections)) {
-        q = ngx_queue_head(&server->pending_reconnections);
-        c = ngx_queue_data(q, ngx_http_auth_ldap_connection_t, queue_pending);
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->r->connection->log, 0,
-            "ngx_http_auth_ldap_get_connection: Got cnx [%d] from pending queue -> shorten reconnect timer", c->cnx_idx);
-        /* Use the shortest the reconnection delay as we really need a new connection here */
-        ngx_del_timer(&c->reconnect_event); // Cancel the reconnect timer
-        ngx_add_timer(&c->reconnect_event, RECONNECT_ASAP_MS);
+        ngx_queue_t *q = ngx_queue_head(&server->pending_reconnections);
+        ngx_http_auth_ldap_connection_t *c = ngx_queue_data(q,
+            ngx_http_auth_ldap_connection_t, queue_pending);
+
+        ngx_del_timer(&c->reconnect_event);
+        ngx_queue_remove(q);
+        ngx_http_auth_ldap_connect(c);  // Original connect function
     }
 
-    q = ngx_queue_next(&server->waiting_requests);
-    while (q != ngx_queue_sentinel(&server->waiting_requests)) {
-        if (q == &ctx->queue) {
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->r->connection->log, 0, "ngx_http_auth_ldap_get_connection: Tried to insert a same request");
-            return 0;
-        }
-        q = ngx_queue_next(q);
-    }
+    // Original waiting queue logic
     ngx_queue_insert_head(&server->waiting_requests, &ctx->queue);
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->r->connection->log, 0, "ngx_http_auth_ldap_get_connection: No connection available at the moment, waiting...");
     return 0;
 }
 
