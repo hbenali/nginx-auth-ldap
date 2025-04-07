@@ -1191,7 +1191,7 @@ ngx_http_auth_ldap_check_cache(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
     ngx_http_auth_ldap_cache_elt_t *elt;
     ngx_md5_t md5ctx;
     ngx_msec_t time_limit;
-    ngx_uint_t i;
+    ngx_uint_t i, expired_count = 0;
 
     ctx->cache_small_hash = ngx_murmur_hash2(r->headers_in.user.data, r->headers_in.user.len) ^ (uint32_t) (ngx_uint_t) server;
 
@@ -1203,8 +1203,23 @@ ngx_http_auth_ldap_check_cache(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
 
     ctx->cache_bucket = &cache->buckets[ctx->cache_small_hash % cache->num_buckets];
 
-    elt = ctx->cache_bucket;
     time_limit = ngx_current_msec - cache->expiration_time;
+    elt = ctx->cache_bucket;
+
+    // First pass: clean expired entries and count them
+    for (i = 0; i < cache->elts_per_bucket; i++, elt++) {
+        if (elt->time < time_limit) {
+            // Clear expired entry
+            elt->small_hash = 0;
+            elt->time = 0;
+            elt->outcome = OUTCOME_ERROR;
+            elt->attributes.nelts = 0;
+            expired_count++;
+        }
+    }
+
+    // Second pass: look for valid entries
+    elt = ctx->cache_bucket;
     for (i = 0; i < cache->elts_per_bucket; i++, elt++) {
         if (elt->small_hash == ctx->cache_small_hash &&
                 elt->time > time_limit &&
@@ -1231,21 +1246,36 @@ static void
 ngx_http_auth_ldap_update_cache(ngx_http_auth_ldap_ctx_t *ctx,
         ngx_http_auth_ldap_cache_t *cache, ngx_flag_t outcome)
 {
-    ngx_http_auth_ldap_cache_elt_t *elt, *oldest_elt;
+    ngx_http_auth_ldap_cache_elt_t *elt, *oldest_elt = NULL;
     ngx_uint_t i;
+    ngx_msec_t time_limit = ngx_current_msec - cache->expiration_time;
+    ngx_msec_t oldest_time = ngx_current_msec;
 
     elt = ctx->cache_bucket;
+
+    // Initialize oldest_elt to first element as a fallback
     oldest_elt = elt;
-    for (i = 1; i < cache->elts_per_bucket; i++, elt++) {
-        if (elt->time < oldest_elt->time) {
+
+    // Find the best slot to use (empty, expired, or oldest)
+    for (i = 0; i < cache->elts_per_bucket; i++, elt++) {
+        if (elt->small_hash == 0 || elt->time < time_limit) {
+            // Found empty or expired slot - use it immediately
+            oldest_elt = elt;
+            break;
+        }
+
+        if (elt->time < oldest_time) {
+            oldest_time = elt->time;
             oldest_elt = elt;
         }
     }
 
+    // Update the cache entry
     oldest_elt->time = ngx_current_msec;
     oldest_elt->outcome = outcome;
     oldest_elt->small_hash = ctx->cache_small_hash;
     ngx_memcpy(oldest_elt->big_hash, ctx->cache_big_hash, 16);
+
     /* save (copy) each attribute from the context to the cache */
     oldest_elt->attributes.nelts = 0;
     for (i = 0; i < ctx->attributes.nelts; i++) {
