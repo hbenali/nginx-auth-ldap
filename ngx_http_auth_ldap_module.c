@@ -2700,11 +2700,23 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 break;
 
             case PHASE_REBIND:
-                /* Initiate bind using the found DN and request password */
+                /* Initiate bind using the Bind DN and associated password */
                 rc = ngx_http_auth_ldap_recover_bind(r, ctx);
                 if (rc == NGX_AGAIN) {
                     /* LDAP operation in progress, wait for the result */
                     return NGX_AGAIN;
+                }
+                if (rc != NGX_OK) {
+                    /* Re-Bind failed, but previous search and bind may have positive outcome */
+                    /* So close the current LDAP connection (that will be restarted ofter reconnect_timeout) */
+                    /* and continue with the next phase */
+                    if (ctx->c != NULL) {
+                        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "ngx_http_auth_ldap_authenticate: Flushing [Cnx:%d] after re-bind failure", ctx->c->cnx_idx);
+                        ngx_http_auth_ldap_close_connection(ctx->c, 0);
+                        ctx->c = NULL; /* Prevent the cnx to be returned in free list in PHASE_NEXT */
+                    }
+                    ctx->phase = PHASE_NEXT;
+                    break;
                 }
 
                 /* All steps done, finish the processing */
@@ -3056,9 +3068,9 @@ ngx_http_auth_ldap_recover_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
     if (ctx->error_code != LDAP_SUCCESS) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "ngx_http_auth_ldap_recover_bind: Cnx[%d] Rebinding to binddn failed (%d: %s)",
             ctx->c->cnx_idx, ctx->error_code, ldap_err2string(ctx->error_code));
+        return NGX_ERROR;
     } else {
-
-        ngx_log_error(NGX_LOG_INFO, ctx->c->log, 0, "ngx_http_auth_ldap_recover_bind: Cnx[%d] Rebinding to binddn successful",
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "ngx_http_auth_ldap_recover_bind: Cnx[%d] Rebinding to binddn successful",
             ctx->c->cnx_idx);
     }
     return NGX_OK;
