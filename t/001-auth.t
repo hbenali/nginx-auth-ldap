@@ -228,7 +228,7 @@ subtest 'config: module directives exist in source' => sub {
         like($content, qr/ldap_server/, "ldap_server directive defined");
         like($content, qr/auth_ldap_cache_enabled/, "auth_ldap_cache_enabled directive defined");
         like($content, qr/auth_ldap_cache_size/, "auth_ldap_cache_size directive defined");
-        like($content, qr/health_check_interval/, "health_check_interval directive defined");
+        like($content, qr/stateless/, "stateless directive defined");
         like($content, qr/variable_basedn/, "variable_basedn directive defined");
         like($content, qr/SHM_CONFIG_VERSION_MAGIC/, "Shared memory infrastructure present");
     }
