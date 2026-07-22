@@ -922,6 +922,8 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
         return NGX_CONF_OK;
 #if (NGX_OPENSSL)
     } else if (ngx_strcmp(server->ludpp->lud_scheme, "ldaps") == 0) {
+        return NGX_CONF_OK;
+        /* FIXME: debug - skip SSL context creation
         ngx_http_auth_ldap_main_conf_t *halmcf =
             ngx_http_conf_get_module_main_conf(cf, ngx_http_auth_ldap_module);
         ngx_uint_t protos = NGX_SSL_TLSv1_2
@@ -936,6 +938,7 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
                 return NGX_CONF_ERROR;
             }
         }
+        */
         return NGX_CONF_OK;
 #endif
     } else {
