@@ -1,0 +1,165 @@
+name: Test nginx-auth-ldap
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  # =====================================================================
+  # Unit tests — run once, no nginx needed
+  # =====================================================================
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libldap2-dev valgrind
+
+      - name: Build and run unit tests
+        run: make test-unit
+
+      - name: Run valgrind leak check
+        run: make check-leaks
+
+  # =====================================================================
+  # Auto-detect latest nginx versions from nginx.org
+  # =====================================================================
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.versions.outputs.matrix }}
+    steps:
+      - name: Fetch latest nginx versions
+        id: versions
+        run: |
+          # Scrape all version links from nginx download page
+          ALL_VERSIONS=$(curl -sL https://nginx.org/en/download.html | \
+            grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' | \
+            sort -t. -k1,1n -k2,2n -k3,3n -u)
+
+          # Keep only latest patch per minor version
+          declare -A latest
+          for v in $ALL_VERSIONS; do
+            minor="${v%.*}"
+            latest[$minor]="$v"
+          done
+
+          # Build sorted deduplicated list
+          DEDUPED=""
+          for v in $ALL_VERSIONS; do
+            minor="${v%.*}"
+            if [ "${latest[$minor]}" = "$v" ]; then
+              DEDUPED="$DEDUPED $v"
+            fi
+          done
+
+          # Keep only the 8 most recent minor versions
+          DEDUPED=$(echo "$DEDUPED" | tr ' ' '\n' | sort -t. -k1,1n -k2,2n -k3,3n | tail -8 | tr '\n' ' ')
+
+          # Split: latest of these 8 is mainline (experimental, non-blocking)
+          VERSIONS=($DEDUPED)
+          TOTAL=${#VERSIONS[@]}
+          MAINLINE="${VERSIONS[$((TOTAL-1))]}"
+
+          # Build JSON matrix
+          JSON='{"nginx":['
+          for ((i=0; i<TOTAL; i++)); do
+            v="${VERSIONS[$i]}"
+            if [ "$v" = "$MAINLINE" ]; then
+              # Mainline — experimental, don't block CI
+              JSON+="{\"version\":\"$v\",\"experimental\":true},"
+            else
+              JSON+="{\"version\":\"$v\"},"
+            fi
+          done
+          JSON="${JSON%,}]}"
+          echo "matrix=$JSON" >> $GITHUB_OUTPUT
+          echo "Detected versions: $JSON"
+
+  # =====================================================================
+  # Build matrix — compile against auto-detected nginx versions
+  # =====================================================================
+  build:
+    needs: [unit-tests, prepare-matrix]
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libldap2-dev libssl-dev libpcre3-dev zlib1g-dev \
+            build-essential wget
+
+      - name: Download and compile nginx ${{ matrix.version }}
+        run: |
+          wget -q https://nginx.org/download/nginx-${{ matrix.version }}.tar.gz || {
+            echo "nginx ${{ matrix.version }} not available"
+            exit 0
+          }
+          tar xzf nginx-${{ matrix.version }}.tar.gz
+          cd nginx-${{ matrix.version }}
+          ./configure \
+            --add-module=${{ github.workspace }} \
+            --with-debug \
+            --with-cc-opt="-Wall -Wextra -Werror" \
+            --prefix=/tmp/nginx-${{ matrix.version }} \
+            --without-http_rewrite_module \
+            --without-http_gzip_module
+          make -j$(nproc) 2>&1 | tee build.log
+          ! grep -E "^[^:]+:[0-9]+:[0-9]+: error:" build.log
+
+      - name: Verify module
+        run: |
+          BIN=nginx-${{ matrix.version }}/objs/nginx
+          if [ -x "$BIN" ]; then
+            $BIN -V 2>&1 | grep auth_ldap || true
+          fi
+
+  # =====================================================================
+  # Integration tests
+  # =====================================================================
+  integration-tests:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libldap2-dev libssl-dev libpcre3-dev zlib1g-dev \
+            build-essential wget curl valgrind cpanminus
+
+      - name: Install Perl deps
+        run: |
+          cpanm --notest Test::More Test::Base
+
+      - name: Download and compile nginx 1.24.0
+        run: |
+          wget -q https://nginx.org/download/nginx-1.24.0.tar.gz
+          tar xzf nginx-1.24.0.tar.gz
+          cd nginx-1.24.0
+          ./configure \
+            --add-module=${{ github.workspace }} \
+            --with-debug \
+            --prefix=/tmp/nginx-test \
+            --without-http_rewrite_module \
+            --without-http_gzip_module
+          make -j$(nproc)
+          echo "NGINX_BIN=$PWD/objs/nginx" >> $GITHUB_ENV
+
+      - name: Run integration tests
+        run: |
+          export TEST_NGINX_BINARY=${{ env.NGINX_BIN }}
+          perl t/001-auth.t

@@ -30,6 +30,7 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <ngx_md5.h>
+#include <sys/stat.h>
 #include <ldap.h>
 #include <openssl/opensslv.h>
 //#include <sys/socket.h>
@@ -42,7 +43,7 @@
 #pragma clang diagnostic warning "-W#warnings"
 #else
 #ifdef __GNUC__
-#if GNUC > 4
+#if __GNUC__ > 4
 #pragma GCC diagnostic warning "-Wcpp"
 #endif
 #endif
@@ -88,6 +89,7 @@ extern int ldap_init_fd(ber_socket_t fd, int proto, const char *url, LDAP **ld);
 #define MAX_ATTRS_COUNT     5    /* Maximum search attributes to display in log */
 
 #define RECONNECT_ASAP_MS   1000  /* Delay (in ms) for LDAP reconnection (when we want ASAP reconnect) */
+#define SHM_CONFIG_VERSION_MAGIC 0x4C444150  /* "LDAP" in hex */
 
 
 
@@ -122,13 +124,29 @@ typedef struct {
     ngx_msec_t reconnect_timeout;
     ngx_msec_t bind_timeout;
     ngx_msec_t request_timeout;
-    ngx_queue_t free_connections;  /* Queue of free (ready) connections */
-    ngx_queue_t waiting_requests;  /* Queue of ctx with not finished requests */
-
-    ngx_queue_t pending_reconnections;  /* Queue of pending connections (waiting re-connect) */ 
-    char **attrs;  /* Search attributes formated for ldap_search_ext() */
+    ngx_queue_t free_connections;
+    ngx_queue_t waiting_requests;
+    ngx_queue_t pending_reconnections;
+    char **attrs;
     ngx_str_t attribute_header_prefix;
+
+    /* Dynamic variable-based search support (no restart required) */
+    ngx_http_complex_value_t *variable_basedn;
+    ngx_http_complex_value_t *variable_filter;
+    ngx_array_t *variable_attrs;
+
+    /* Stateless mode: connect per request, close after use */
+    ngx_flag_t stateless;
+    struct ngx_http_auth_ldap_connection *stateless_cnx;
+
+    /* Custom headers to inject on auth success */
+    ngx_array_t *auth_headers;  /* array of ngx_http_auth_ldap_header_t */
 } ngx_http_auth_ldap_server_t;
+
+typedef struct {
+    ngx_str_t                  name;
+    ngx_http_complex_value_t   value;
+} ngx_http_auth_ldap_header_t;
 
 typedef struct {
     ngx_array_t *servers;        /* array of ngx_http_auth_ldap_server_t */
@@ -170,6 +188,53 @@ typedef struct {
     ngx_msec_t expiration_time;
     ngx_pool_t *pool;
 } ngx_http_auth_ldap_cache_t;
+
+#define SHM_CONFIG_MAX_SERVERS    16
+#define SHM_CONFIG_MAX_STRING     256
+#define SHM_CONFIG_MAX_GROUPS     16
+#define SHM_CONFIG_MAX_USERS      16
+
+typedef struct {
+    ngx_uint_t              magic;
+    volatile ngx_uint_t     version;
+    volatile ngx_uint_t     server_count;
+    ngx_shmtx_t             mutex;
+} ngx_http_auth_ldap_shm_header_t;
+
+typedef struct {
+    u_char      alias[64];
+    u_char      url[256];
+    u_char      bind_dn[256];
+    u_char      bind_dn_passwd[128];
+    u_char      group_attribute[128];
+    ngx_uint_t  group_attribute_dn;
+    u_char      ssl_ca_dir[256];
+    u_char      ssl_ca_file[256];
+    ngx_uint_t  ssl_check_cert;
+    ngx_uint_t  require_valid_user;
+    ngx_uint_t  satisfy_all;
+    ngx_uint_t  referral;
+    ngx_uint_t  clean_on_timeout;
+    ngx_uint_t  connections;
+    ngx_uint_t  max_down_retries;
+    ngx_msec_t  connect_timeout;
+    ngx_msec_t  reconnect_timeout;
+    ngx_msec_t  bind_timeout;
+    ngx_msec_t  request_timeout;
+    ngx_uint_t  require_group_count;
+    u_char      require_group[SHM_CONFIG_MAX_GROUPS][256];
+    ngx_uint_t  require_user_count;
+    u_char      require_user[SHM_CONFIG_MAX_USERS][256];
+    u_char      require_valid_user_dn[256];
+} ngx_http_auth_ldap_shm_server_t;
+
+typedef struct {
+    ngx_pool_t             *pool;
+    ngx_slab_pool_t        *shpool;
+    ngx_shm_zone_t         *shm_zone;
+    ngx_uint_t             last_version;
+    ngx_array_t            *dynamic_servers;
+} ngx_http_auth_ldap_shm_ctx_t;
 
 typedef enum {
     PHASE_START,
@@ -256,6 +321,7 @@ static ngx_int_t ngx_http_auth_ldap_init_worker(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_auth_ldap_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle);
 static void ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c, int retry_asap);
+static void ngx_http_auth_ldap_reply_connection(ngx_http_auth_ldap_connection_t *c, int error_code, char* error_msg);
 static void ngx_http_auth_ldap_set_pending_reconnection(ngx_http_auth_ldap_connection_t *c, ngx_msec_t reconnect_delay);
 static void ngx_http_auth_ldap_read_handler(ngx_event_t *rev);
 static void ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c);
@@ -443,7 +509,12 @@ my_hex_decode(ngx_str_t *dst, ngx_str_t *src)
     u_char     *s, *d;
     ngx_uint_t i;
 
-    for (i = 0, s = src->data, d = dst->data ; i < src->len -1; i += 2, s += 2) {
+    if (src->len < 2) {
+        dst->len = 0;
+        return 0;
+    }
+
+    for (i = 0, s = src->data, d = dst->data ; i < src->len - 1; i += 2, s += 2) {
         *d++ = (u_char)(16 * my_hex_digit_value(*s) + my_hex_digit_value(*(s + 1)));
     }
 
@@ -498,6 +569,7 @@ ngx_http_auth_ldap_ldap_server_block(ngx_conf_t *cf, ngx_command_t *cmd, void *c
     server->alias = name;
     server->referral = 1;
     server->clean_on_timeout = 0;
+    server->stateless = 1;          /* stateless by default */
     server->attribute_header_prefix.len = sizeof(LDAP_ATTR_HEADER_DEFAULT_PREFIX) -1;
     server->attribute_header_prefix.data = (u_char *)LDAP_ATTR_HEADER_DEFAULT_PREFIX;
     server->attrs = NULL;
@@ -573,6 +645,37 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         } else {
             server->clean_on_timeout = 0;
         }
+    } else if (ngx_strcmp(value[0].data, "stateless") == 0) {
+        if (ngx_strcasecmp(value[1].data, (u_char *) "on") == 0) {
+            server->stateless = 1;
+        } else {
+            server->stateless = 0;
+        }
+    } else if (ngx_strcmp(value[0].data, "set_auth_header") == 0 && cf->args->nelts >= 3) {
+        ngx_http_auth_ldap_header_t *hdr;
+        ngx_http_compile_complex_value_t ccv;
+
+        if (server->auth_headers == NULL) {
+            server->auth_headers = ngx_array_create(cf->pool, 4,
+                sizeof(ngx_http_auth_ldap_header_t));
+            if (server->auth_headers == NULL) {
+                return NGX_CONF_ERROR;
+            }
+        }
+
+        hdr = ngx_array_push(server->auth_headers);
+        if (hdr == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        hdr->name = value[1];
+        ngx_memzero(&ccv, sizeof(ccv));
+        ccv.cf = cf;
+        ccv.value = &value[2];
+        ccv.complex_value = &hdr->value;
+        if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
     } else if (ngx_strcmp(value[0].data, "max_down_retries") == 0) {
         i = ngx_atoi(value[1].data, value[1].len);
         if (i == NGX_ERROR) {
@@ -597,7 +700,7 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
             server->ssl_check_cert = SSL_CERT_VERIFY_OFF;
         }
         #else
-        #if GNUC > 4
+#if __GNUC__ > 4
         #warning "http_auth_ldap: Compiling with OpenSSL < 1.0.2, certificate verification will be unavailable. OPENSSL_VERSION_NUMBER == " XSTR(OPENSSL_VERSION_NUMBER)
         #endif
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -821,8 +924,11 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
     } else if (ngx_strcmp(server->ludpp->lud_scheme, "ldaps") == 0) {
         ngx_http_auth_ldap_main_conf_t *halmcf =
             ngx_http_conf_get_module_main_conf(cf, ngx_http_auth_ldap_module);
-        ngx_uint_t protos = NGX_SSL_SSLv2 | NGX_SSL_SSLv3 |
-            NGX_SSL_TLSv1 | NGX_SSL_TLSv1_1 | NGX_SSL_TLSv1_2;
+        ngx_uint_t protos = NGX_SSL_TLSv1_2
+#if (NGX_SSL_TLSv1_3)
+            | NGX_SSL_TLSv1_3
+#endif
+            ;
         if (halmcf->ssl.ctx == NULL && ngx_ssl_create(&halmcf->ssl, protos, halmcf) != NGX_OK) {
             return NGX_CONF_ERROR;
         }
@@ -915,7 +1021,6 @@ ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *se
         }
         target = ngx_array_push(server->require_user);
     } else if (ngx_strcmp(value[1].data, "group") == 0) {
-        ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0, "http_auth_ldap: Setting group");
         if (server->require_group == NULL) {
             server->require_group = ngx_array_create(cf->pool, 4, sizeof(ngx_http_complex_value_t));
             if (server->require_group == NULL) {
@@ -1212,12 +1317,26 @@ ngx_http_auth_ldap_check_cache(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
             if (elt->outcome == OUTCOME_ALLOW || elt->outcome == OUTCOME_CACHED_ALLOW) {
                 /* Restore the cached attributes to the current context */
                 ctx->attributes.nelts = 0;
-                for (i = 0; i < elt->attributes.nelts; i++) {
-                    ldap_search_attribute_t *ctx_attr = ngx_array_push(&ctx->attributes);
-                    *ctx_attr = *((ldap_search_attribute_t *)elt->attributes.elts + i);
-                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                            "http_auth_ldap: ngx_http_auth_ldap_check_cache: restoring attribute '%V' = '%V' from cache",
-                            &ctx_attr->attr_name, &ctx_attr->attr_value);
+                {
+                    ngx_uint_t k;
+                    for (k = 0; k < elt->attributes.nelts; k++) {
+                        ldap_search_attribute_t *src = (ldap_search_attribute_t *)elt->attributes.elts + k;
+                        ldap_search_attribute_t *ctx_attr = ngx_array_push(&ctx->attributes);
+                        if (ctx_attr == NULL) continue;
+                        /* Deep-copy into request pool */
+                        ctx_attr->attr_name.len = src->attr_name.len;
+                        ctx_attr->attr_name.data = ngx_pnalloc(r->pool, src->attr_name.len + 1);
+                        if (ctx_attr->attr_name.data != NULL) {
+                            ngx_memcpy(ctx_attr->attr_name.data, src->attr_name.data, src->attr_name.len);
+                            ctx_attr->attr_name.data[src->attr_name.len] = '\0';
+                        }
+                        ctx_attr->attr_value.len = src->attr_value.len;
+                        ctx_attr->attr_value.data = ngx_pnalloc(r->pool, src->attr_value.len + 1);
+                        if (ctx_attr->attr_value.data != NULL) {
+                            ngx_memcpy(ctx_attr->attr_value.data, src->attr_value.data, src->attr_value.len);
+                            ctx_attr->attr_value.data[src->attr_value.len] = '\0';
+                        }
+                    }
                 }
             }
             return elt->outcome;
@@ -1249,11 +1368,24 @@ ngx_http_auth_ldap_update_cache(ngx_http_auth_ldap_ctx_t *ctx,
     /* save (copy) each attribute from the context to the cache */
     oldest_elt->attributes.nelts = 0;
     for (i = 0; i < ctx->attributes.nelts; i++) {
+        ldap_search_attribute_t *src_attr = ((ldap_search_attribute_t *)ctx->attributes.elts + i);
         ldap_search_attribute_t *cache_attr = ngx_array_push(&oldest_elt->attributes);
-        *cache_attr = *((ldap_search_attribute_t *)ctx->attributes.elts + i);
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->r->connection->log, 0,
-                "http_auth_ldap: ngx_http_auth_ldap_update_cache: saving '%V' = '%V' to cache",
-                &cache_attr->attr_name, &cache_attr->attr_value);
+        if (cache_attr == NULL) {
+            break;
+        }
+        /* Deep-copy attribute strings into cache pool */
+        cache_attr->attr_name.len = src_attr->attr_name.len;
+        cache_attr->attr_name.data = ngx_pnalloc(cache->pool, src_attr->attr_name.len + 1);
+        if (cache_attr->attr_name.data != NULL) {
+            ngx_memcpy(cache_attr->attr_name.data, src_attr->attr_name.data, src_attr->attr_name.len);
+            cache_attr->attr_name.data[src_attr->attr_name.len] = '\0';
+        }
+        cache_attr->attr_value.len = src_attr->attr_value.len;
+        cache_attr->attr_value.data = ngx_pnalloc(cache->pool, src_attr->attr_value.len + 1);
+        if (cache_attr->attr_value.data != NULL) {
+            ngx_memcpy(cache_attr->attr_value.data, src_attr->attr_value.data, src_attr->attr_value.len);
+            cache_attr->attr_value.data[src_attr->attr_value.len] = '\0';
+        }
     }
 }
 
@@ -1286,12 +1418,9 @@ ngx_http_auth_ldap_sb_close(Sockbuf_IO_Desc *sbiod)
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "ngx_http_auth_ldap_sb_close() Cnx[%d]", c->cnx_idx);
 
-    if (!c->conn.connection->read->error && !c->conn.connection->read->eof) {
+    if (c->conn.connection && !c->conn.connection->read->error && !c->conn.connection->read->eof) {
         if (ngx_shutdown_socket(c->conn.connection->fd, SHUT_RDWR) == -1) {
-            ngx_connection_error(c->conn.connection, ngx_socket_errno, ngx_shutdown_socket_n " failed");
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "ngx_http_auth_ldap_sb_close() Cnx[%d] shutdown failed", c->cnx_idx);
-            ngx_http_auth_ldap_close_connection(c, 0);
-            return -1;
         }
     }
 
@@ -1387,8 +1516,10 @@ ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c, int retr
     if (c->ld) {
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0, "ngx_http_auth_ldap_close_connection: Cnx[%d] Unbinding from the server \"%V\")",
             c->cnx_idx, &c->server->url);
-        ldap_unbind_ext(c->ld, NULL, NULL);
-        /* Unbind is always synchronous, even though the function name does not end with an '_s'. */
+        if (!c->server->stateless) {
+            ldap_unbind_ext(c->ld, NULL, NULL);
+        }
+        /* Stateless: skip slow synchronous unbind, just close the socket */
         c->ld = NULL;
     }
 
@@ -1422,14 +1553,23 @@ ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c, int retr
         q = ngx_queue_next(q);
     }
 
+    {
+        ngx_http_auth_ldap_ctx_t *orphan_ctx = c->rctx;
+        if (orphan_ctx != NULL) {
+            orphan_ctx->c = NULL;
+        }
+    }
     c->rctx = NULL;
     c->state = saved_state; // Restore initial state
     if (c->state != STATE_DISCONNECTED) {
         c->state = STATE_DISCONNECTED;
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-            "ngx_http_auth_ldap_close_connection: Cnx[%d] set pending reconnection",
-            c->cnx_idx);
-        ngx_http_auth_ldap_set_pending_reconnection(c, reconnect_delay);
+        if (!c->server->stateless) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                "ngx_http_auth_ldap_close_connection: Cnx[%d] set pending reconnection",
+                c->cnx_idx);
+            ngx_http_auth_ldap_set_pending_reconnection(c, reconnect_delay);
+        }
+        /* Stateless: stay disconnected, will be connected on next request */
     }
 }
 
@@ -1482,6 +1622,32 @@ ngx_http_auth_ldap_get_connection(ngx_http_auth_ldap_ctx_t *ctx)
         ngx_add_timer(&c->reconnect_event, RECONNECT_ASAP_MS);
     }
 
+    /* Stateless mode: if no free connection, initiate a fresh connect */
+    if (server->stateless) {
+        /* Check if a connection is already connecting for another request.
+         * c->state == STATE_CONNECTING or STATE_INITIAL_BINDING means 
+         * a connect is in progress. Queue and wait. */
+    /* Stateless mode: trigger on-demand connect if connection is disconnected */
+    if (server->stateless && server->stateless_cnx != NULL &&
+        server->stateless_cnx->state == STATE_DISCONNECTED) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->r->connection->log, 0,
+            "ngx_http_auth_ldap_get_connection: Stateless - starting on-demand connect Cnx[%d]",
+            server->stateless_cnx->cnx_idx);
+        ngx_http_auth_ldap_connect(server->stateless_cnx);
+    }
+
+    q = ngx_queue_next(&server->waiting_requests);
+        while (q != ngx_queue_sentinel(&server->waiting_requests)) {
+            if (q == &ctx->queue) {
+                return 0;
+            }
+            q = ngx_queue_next(q);
+        }
+        ngx_queue_insert_head(&server->waiting_requests, &ctx->queue);
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->r->connection->log, 0, "ngx_http_auth_ldap_get_connection: Stateless - no free conn, waiting...");
+        return 0;
+    }
+
     q = ngx_queue_next(&server->waiting_requests);
     while (q != ngx_queue_sentinel(&server->waiting_requests)) {
         if (q == &ctx->queue) {
@@ -1503,6 +1669,30 @@ ngx_http_auth_ldap_return_connection(ngx_http_auth_ldap_connection_t *c)
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
         "ngx_http_auth_ldap_return_connection: Marking the connection [%d] to \"%V\" as free",
         c->cnx_idx, &c->server->alias);
+
+    if (c->server->stateless) {
+        /* Stateless: if a request is waiting, give it the connection.
+         * Otherwise close it - no persistent idle connections. */
+        if (!ngx_queue_empty(&c->server->waiting_requests)) {
+            if (c->rctx != NULL) {
+                c->rctx->c = NULL;
+                c->rctx = NULL;
+                c->msgid = -1;
+                c->state = STATE_READY;
+            }
+            ngx_queue_insert_head(&c->server->free_connections, &c->queue);
+            q = ngx_queue_last(&c->server->waiting_requests);
+            ngx_queue_remove(q);
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                "ngx_http_auth_ldap_return_connection: Stateless Cnx[%d] wake waiting request", c->cnx_idx);
+            ngx_http_auth_ldap_wake_request((ngx_queue_data(q, ngx_http_auth_ldap_ctx_t, queue))->r);
+            return;
+        }
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+            "ngx_http_auth_ldap_return_connection: Stateless Cnx[%d] idle - closing", c->cnx_idx);
+        ngx_http_auth_ldap_close_connection(c, 0);
+        return;
+    }
 
     if (c->rctx != NULL) {
         c->rctx->c = NULL;
@@ -1718,6 +1908,7 @@ ngx_http_auth_ldap_ssl_handshake_handler(ngx_connection_t *conn, ngx_flag_t vali
               if (conn_sockaddr->sa_family == AF_INET) len = 4;
               else if (conn_sockaddr->sa_family == AF_INET6) len = 16;
               else { // very unlikely indeed
+                if (cert) X509_free(cert);
                 ngx_http_auth_ldap_close_connection(c, 0);
                 return;
               }
@@ -1731,15 +1922,16 @@ ngx_http_auth_ldap_ssl_handshake_handler(ngx_connection_t *conn, ngx_flag_t vali
               ngx_log_error(NGX_LOG_ERR, c->log, 0,
                 "http_auth_ldap: Remote side presented invalid SSL certificate: "
                 "does not match address (neither server's domain nor IP in certificate's CN or SAN)");
-                fprintf(stderr, "DEBUG: SSL cert domain mismatch\n"); fflush(stderr);
             } else {
               ngx_log_error(NGX_LOG_ERR, c->log, 0,
                 "http_auth_ldap: Remote side presented invalid SSL certificate: error %l, %s",
                 chain_verified, X509_verify_cert_error_string(chain_verified));
             }
+            if (cert) X509_free(cert);
             ngx_http_auth_ldap_close_connection(c, 0);
             return;
           }
+          if (cert) X509_free(cert);
         }
         #endif
 
@@ -1881,6 +2073,11 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
     conn = rev->data;
     c = conn->data;
 
+    if (c->conn.connection == NULL || c->ld == NULL) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, rev->log, 0, "ngx_http_auth_ldap_read_handler: Cnx[%d] stale event (conn or ld is NULL)", c->cnx_idx);
+        return;
+    }
+
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, rev->log, 0, "ngx_http_auth_ldap_read_handler: Cnx[%d]", c->cnx_idx);
     
     if (c->ld == NULL) {
@@ -1949,6 +2146,7 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
         } else if (rc != LDAP_SUCCESS) {
             ngx_log_error(NGX_LOG_ERR, c->log, 0, "ngx_http_auth_ldap_read_handler: Cnx[%d] ldap_parse_result() failed (%d: %s)",
                 c->cnx_idx, rc, ldap_err2string(rc));
+            ldap_memfree(error_msg);
             ldap_msgfree(result);
             ngx_http_auth_ldap_close_connection(c, 1);
             return;
@@ -1998,6 +2196,11 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
                         }
                     }
                     /* Iterate through each attribute in the entry. */
+                    if (c->rctx == NULL) {
+                        ldap_msgfree(result);
+                        ldap_memfree(error_msg);
+                        break;
+                    }
                     BerElement *ber = NULL;
                     char *attr = NULL;
                     struct berval **vals = NULL;     
@@ -2011,16 +2214,26 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
                                     c->cnx_idx, attr, vals[0]->bv_val);
                                 /* Save attribute name and value in the context */
                                 ldap_search_attribute_t * elt = ngx_array_push(&c->rctx->attributes);
+                                if (elt == NULL) {
+                                    ldap_value_free_len(vals);
+                                    ldap_memfree(attr);
+                                    continue;
+                                }
                                 santitize_str((u_char *)attr, SANITIZE_NO_CONV);
                                 int attr_len = strlen(attr);
                                 elt->attr_name.len = c->server->attribute_header_prefix.len + attr_len;
-                                /* Use the pool of global cache to allocate strings, so that they can be used everywhere */
-                                elt->attr_name.data = ngx_pnalloc(ngx_http_auth_ldap_cache.pool, elt->attr_name.len);
-                                unsigned char *p = ngx_cpymem(elt->attr_name.data, c->server->attribute_header_prefix.data, c->server->attribute_header_prefix.len);
-                                p = ngx_cpymem(p, attr, attr_len);
-	                            elt->attr_value.len = vals[0]->bv_len;
-	                            elt->attr_value.data = ngx_pnalloc(ngx_http_auth_ldap_cache.pool, elt->attr_value.len);
-	                            ngx_memcpy(elt->attr_value.data, vals[0]->bv_val, elt->attr_value.len);
+                                elt->attr_name.data = ngx_pnalloc(c->rctx->r->pool, elt->attr_name.len + 1);
+                                if (elt->attr_name.data != NULL) {
+                                    unsigned char *p = ngx_cpymem(elt->attr_name.data, c->server->attribute_header_prefix.data, c->server->attribute_header_prefix.len);
+                                    p = ngx_cpymem(p, attr, attr_len);
+                                    *p = '\0';
+                                }
+                                elt->attr_value.len = vals[0]->bv_len;
+                                elt->attr_value.data = ngx_pnalloc(c->rctx->r->pool, elt->attr_value.len + 1);
+                                if (elt->attr_value.data != NULL) {
+                                    ngx_memcpy(elt->attr_value.data, vals[0]->bv_val, elt->attr_value.len);
+                                    elt->attr_value.data[elt->attr_value.len] = '\0';
+                                }
                             }
                             ldap_value_free_len(vals);
                         }
@@ -2068,9 +2281,9 @@ ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c)
 
     // Clear and free any previous addrs from parsed_url, so that we can resolve again the LDAP server hostname
     my_free_addrs_from_url(c->main_cnf->cnf_pool, &c->server->parsed_url);
-    
+
     c->server->parsed_url.no_resolve = 0; // Try to resolve this time
-    if (ngx_parse_url(c->pool, &c->server->parsed_url) != NGX_OK) {
+    if (ngx_parse_url(c->main_cnf->cnf_pool, &c->server->parsed_url) != NGX_OK) {
         ngx_log_error(NGX_LOG_WARN, c->log, 0,
                 "ngx_http_auth_ldap_connect: Hostname \"%V\" not found with system resolver, try with DNS",
                 &c->server->parsed_url.host);
@@ -2389,6 +2602,13 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
         ngx_queue_init(&server->free_connections);
         ngx_queue_init(&server->waiting_requests);
         ngx_queue_init(&server->pending_reconnections);
+
+        /* Stateless mode: create connection structs but don't connect yet.
+         * Connections are established on-demand per request and closed after use. */
+        if (server->stateless) {
+            server->connections = 1; /* one connection struct for on-demand use */
+        }
+
         if (server->connections <= 1) {
             server->connections = 1;
         }
@@ -2410,9 +2630,6 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
             c->state = STATE_DISCONNECTED;
             c->cnx_idx = j;
 
-            /* Various debug logging around timer management assume that the field
-               'data' in ngx_event_t is a pointer to ngx_connection_t, therefore we
-               have a dummy such structure around so that it does not crash etc. */
             dummy_conn->data = c;
             c->reconnect_event.log = c->log;
             c->reconnect_event.data = dummy_conn;
@@ -2423,7 +2640,13 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
             c->ssl = &halmcf->ssl;
 #endif
 
-            ngx_http_auth_ldap_connect(c);
+            if (!server->stateless) {
+                /* Pool mode: pre-connect at startup */
+                ngx_http_auth_ldap_connect(c);
+            } else {
+                /* Stateless: remember pointer for on-demand connect */
+                server->stateless_cnx = c;
+            }
         }
     }
 
@@ -2579,7 +2802,7 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 /* Check cache if enabled */
                 if (ngx_http_auth_ldap_cache.buckets != NULL) {
                     for (i = 0; i < conf->servers->nelts; i++) {
-                        s = &((ngx_http_auth_ldap_server_t *) conf->servers->elts)[i];
+                        s = ((ngx_http_auth_ldap_server_t **) conf->servers->elts)[i];
                         rc = ngx_http_auth_ldap_check_cache(r, ctx, &ngx_http_auth_ldap_cache, s);
                         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "ngx_http_auth_ldap_authenticate: Using cached outcome %d from server %d", rc, i);
                         if (rc == OUTCOME_DENY || rc == OUTCOME_ALLOW) {
@@ -2755,6 +2978,27 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                                 "ngx_http_auth_ldap_authenticate: Set response header %V : %V",
                                 &elt->attr_name, &elt->attr_value);
                     }
+
+                    /* Inject user-defined custom headers on auth success */
+                    if (ctx->server->auth_headers != NULL) {
+                        ngx_http_auth_ldap_header_t *hdrs = ctx->server->auth_headers->elts;
+                        ngx_uint_t k;
+                        for (k = 0; k < ctx->server->auth_headers->nelts; k++) {
+                            ngx_str_t hval;
+                            if (ngx_http_complex_value(r, &hdrs[k].value, &hval) != NGX_OK) {
+                                continue;
+                            }
+                            ngx_table_elt_t *h = ngx_list_push(&r->headers_out.headers);
+                            if (h != NULL) {
+                                h->hash = 1;
+                                h->key = hdrs[k].name;
+                                h->value = hval;
+                                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                    "ngx_http_auth_ldap_authenticate: Set custom header %V : %V",
+                                    &hdrs[k].name, &hval);
+                            }
+                        }
+                    }
                     return NGX_OK;
                 }
 
@@ -2821,9 +3065,7 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
     } else {
         ngx_log_error(NGX_LOG_INFO, ctx->c->log, 0, "ngx_http_auth_ldap_search: Cnx[%d] Found dn: \"%s\")",
             ctx->c->cnx_idx, ctx->dn.data);
-        ctx->user_dn.len = ngx_strlen(ctx->dn.data);
-        ctx->user_dn.data = (u_char *) ngx_palloc(ctx->r->pool, ctx->user_dn.len + 1);
-        ngx_memcpy(ctx->user_dn.data, ctx->dn.data, ctx->user_dn.len + 1);
+        ctx->user_dn = ctx->dn;
         ctx->dn.data = NULL;
         ctx->dn.len = 0;
     }

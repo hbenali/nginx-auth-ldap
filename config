@@ -8,6 +8,11 @@ case "$NGX_PLATFORM" in
     ;;
 esac
 
+# Require OpenSSL for LDAPS and TLS support
+if [ "$NGX_PLATFORM" != "win32" ]; then
+    LDAP_REQUIRED_LIBS="$LDAP_REQUIRED_LIBS -lssl -lcrypto"
+fi
+
 if test -n "$ngx_module_link"; then
     ngx_module_type=HTTP
     ngx_module_name=ngx_http_auth_ldap_module

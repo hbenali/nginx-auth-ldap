@@ -1,0 +1,42 @@
+FROM alpine:3.23 AS build
+
+WORKDIR /src
+
+RUN apk add --no-cache \
+    build-base pcre2-dev zlib-dev openssl-dev openldap-dev \
+    wget linux-headers
+
+RUN wget -q https://nginx.org/download/nginx-1.30.4.tar.gz -O - | tar xzC /src \
+    && mv /src/nginx-1.30.4 /src/nginx
+
+COPY . /src/nginx-auth-ldap
+
+RUN cd /src/nginx \
+    && ./configure \
+    --prefix=/etc/nginx \
+    --sbin-path=/usr/sbin/nginx \
+    --conf-path=/etc/nginx/nginx.conf \
+    --error-log-path=/var/log/nginx/error.log \
+    --pid-path=/var/run/nginx.pid \
+    --with-debug \
+    --with-http_ssl_module \
+    --with-http_realip_module \
+    --add-module=/src/nginx-auth-ldap \
+    && make -j$(nproc) \
+    && make install \
+    && strip -s /usr/sbin/nginx
+
+FROM alpine:3.23
+
+RUN apk add --no-cache pcre2 zlib openssl libldap curl
+
+COPY --from=build /usr/sbin/nginx /usr/sbin/nginx
+COPY --from=build /etc/nginx /etc/nginx
+
+RUN mkdir -p /var/log/nginx /var/cache/nginx /var/run \
+    && addgroup -S nginx && adduser -S -h /var/cache/nginx -G nginx nginx \
+    && chown nginx:nginx /var/log/nginx /var/cache/nginx
+
+EXPOSE 8080
+
+CMD ["nginx", "-g", "daemon off;"]

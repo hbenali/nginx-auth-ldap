@@ -2,25 +2,18 @@
 
 LDAP module for nginx which supports authentication against multiple LDAP servers.
 
-## Project history
+## Features
 
-This project is a clone of [nginx-auth-ldap](https://github.com/kvspb/nginx-auth-ldap)  original module from [kvspb](https://github.com/kvspb).
-
-The reasons for this fork are:
-
-* The original project seems abondonned (no commit since 2 years).
-* Inherit from other contributors fixes/features:
-  * [Pull request #237](https://github.com/kvspb/nginx-auth-ldap/pull/237) from [mmguero-dev](https://github.com/mmguero-dev/nginx-auth-ldap).
-  * Compatible with Nginx 1.23.0 (http headers are now linked).
-* Add new features:
-  * Add the use of `resolver` to resolve hostname of the LDAP server.
-  * Support LDAP attributes fecthing during search.
-  * Added an `encoding` attribute to the binddn_passwd parameter.
-  * Manage connections waiting a reconnect delay in a specific queue, so that we can
-    cancel the reconnect delay when a new request ask for an authentication and no free
-    connection is available, but some are waiting to re-connect.
-  * Fix the usage of `max_down_retries` parameter
-  * Add the `clean_on_timeout` option
+- Multiple LDAP server support with failover
+- User/group membership authorization (`require user`, `require group`, `require valid_user`, `satisfy all|any`)
+- LDAP attribute fetching (injected as HTTP headers)
+- **Stateless mode** — connect on-demand, no persistent connections (default)
+- **Connection pool mode** — persistent connections for high-throughput
+- **Custom header injection** — `set_auth_header` with nginx variable support
+- Authentication result caching
+- DNS resolver fallback for LDAP hostname resolution
+- LDAPS (TLS) with certificate verification
+- Base64/hex-encoded bind passwords
 
 ## How to install
 
@@ -29,294 +22,319 @@ The reasons for this fork are:
 ```bash
 cd /usr/ports/www/nginx && make config install clean
 ```
-
-Check HTTP_AUTH_LDAP options
-
-```text
-[*] HTTP_AUTH_LDAP        3rd party http_auth_ldap module
-```
+Check HTTP_AUTH_LDAP option.
 
 ### Linux
 
 ```bash
-cd ~ && git clone https://github.com/Ericbla/nginx-auth-ldap.git   
-```
-
-in nginx source folder
-
-```bash
-./configure --add-module=path_to_http_auth_ldap_module
+git clone https://github.com/Ericbla/nginx-auth-ldap.git
+cd nginx-source
+./configure --add-module=/path/to/nginx-auth-ldap
 make install
 ```
 
-## Example configuration
+## Quick start (stateless, recommended)
 
-Define list of your LDAP servers with required user/group requirements:
+```nginx
+http {
+    auth_ldap_cache_enabled on;
+    auth_ldap_cache_expiration_time 10m;
+    auth_ldap_cache_size 500;
 
-```bash
-    http {
-      auth_ldap_resolver 8.8.8.8;
-
-      ldap_server test1 {
-        url ldap://192.168.0.1:3268/DC=test,DC=local?sAMAccountName?sub?(objectClass=person);
-        binddn "TEST\\LDAPUSER";
-        binddn_passwd LDAPPASSWORD;
-        group_attribute uniquemember;
+    ldap_server my_ldap {
+        url ldap://ldap.example.com:389/DC=example,DC=com?uid?sub?(objectClass=person);
+        binddn "CN=svc-nginx,OU=ServiceAccounts,DC=example,DC=com";
+        binddn_passwd "s3cret";
+        group_attribute member;
         group_attribute_is_dn on;
         require valid_user;
-      }
+        search_attributes mail displayName department;
 
-      ldap_server test2 {
-        url ldap://192.168.0.2:3268/DC=test,DC=local?sAMAccountName?sub?(objectClass=person);
-        binddn "TEST\\LDAPUSER";
-        binddn_passwd LDAPPASSWORD;
-        group_attribute uniquemember;
-        group_attribute_is_dn on;
-        require valid_user;
-      }
+        # Tight timeouts for stateless mode
+        connect_timeout 3s;
+        bind_timeout 2s;
+        request_timeout 5s;
+
+        # Inject custom headers on auth success
+        set_auth_header X-Auth-User $remote_user;
+        set_auth_header X-Auth-Role editor;
     }
+
+    server {
+        listen 80;
+
+        location /private {
+            auth_ldap "Restricted Area";
+            auth_ldap_servers my_ldap;
+            proxy_pass http://backend;
+        }
+    }
+}
 ```
 
-And add required servers in correct order into your location/server directive:
+## Connection modes
 
-```bash
-    server {
-        listen       8000;
-        server_name  localhost;
+### Stateless (default)
 
-        auth_ldap "Forbidden";
-        auth_ldap_servers test1;
-        auth_ldap_servers test2;
+Connects to LDAP on each request, closes immediately after. No idle connections, no health checks needed, zero load on LDAP server between requests. Good for most use cases.
 
-        location / {
-            root   html;
-            index  index.html index.htm;
-        }
+```nginx
+ldap_server my_ldap {
+    url ldap://...;
+    stateless on;   # optional, this is the default
+}
+```
 
-    }
+### Connection pool
+
+Pre-establishes persistent connections at startup. Lower latency per request but holds connections open. Use for high-traffic endpoints.
+
+```nginx
+ldap_server my_ldap {
+    url ldap://...;
+    stateless off;
+    connections 5;  # pool size per worker
+}
 ```
 
 ## Available config parameters
 
-### auth_ldap_cache_enabled
+### Main context (http)
 
-* Syntax: auth_ldap_cache_enabled on | off;
-* Default: auth_ldap_cache_enabled off;
-* Context: http
+#### auth_ldap_cache_enabled
 
-### auth_ldap_cache_expiration_time
+> **Syntax:** `auth_ldap_cache_enabled on | off;`
+> **Default:** `off`
+> **Context:** `http`
 
-* Syntax: auth_ldap_cache_expiration_time time;
-* Default: auth_ldap_cache_expiration_time 10s;
-* Context: http
+Enable caching of authentication results.
 
-Cache expiration time (see <https://nginx.org/en/docs/syntax.html> for time intervals syntax).
+#### auth_ldap_cache_expiration_time
 
-### auth_ldap_cache_size
+> **Syntax:** `auth_ldap_cache_expiration_time time;`
+> **Default:** `10s`
+> **Context:** `http`
 
-* Syntax: auth_ldap_cache_size size;
-* Default: auth_ldap_cache_size 100;
-* Context: http
+Cache entry TTL. When cached, subsequent identical requests skip LDAP entirely.
 
-Number of cached LDAP authentications (min 100)
+#### auth_ldap_cache_size
 
-### auth_ldap_servers_size
+> **Syntax:** `auth_ldap_cache_size size;`
+> **Default:** `100`
+> **Context:** `http`
 
-* Syntax: auth_ldap_servers_size size;
-* Syntax: auth_ldap_servers_size 7;
-* Context: http
+Number of cached entries (minimum 100).
 
-Maximum number of `ldap_server` elements to support
+#### auth_ldap_servers_size
 
-### auth_ldap
+> **Syntax:** `auth_ldap_servers_size size;`
+> **Default:** `7`
+> **Context:** `http`
 
-* Syntax: auth_ldap off | _realm_;
-* Default: --
-* Context: http, server, loc, limit_expect
+Maximum number of `ldap_server` definitions allowed.
 
-Set the _realm_ to be used with the `WWW-Authenticate` response header when authentication failed or is missing.
+#### auth_ldap_resolver
 
-### auth_ldap_servers
+> **Syntax:** `auth_ldap_resolver address ... [valid=time] ...;`
+> **Default:** `--`
+> **Context:** `http`
 
-* Syntax: auth_ldap_servers _name_;
-* Default: --
-* Context: http, server, loc, limit_expect
+DNS resolver for fallback when system resolver cannot resolve the LDAP hostname.
 
-Select the server _name_ to work with user authentication
+#### auth_ldap_resolver_timeout
 
-### auth_ldap_resolver
+> **Syntax:** `auth_ldap_resolver_timeout time;`
+> **Default:** `10s`
+> **Context:** `http`
 
-* Syntax: auth_ldap_resolver _address_ ... [valid=time] [ipv4=on|off] [ipv6=on|off] [status_zone=zone];
-* Default: --
-* Context: http
+Resolver query timeout.
 
-The resolver to use as a fallback when the system hostname resolution
-(gethostbyname()) can't resolve the LDAP server hostname.
-See the `resolver` directive of the **ngx_http_core_module**
+### Location/server context
 
-### auth_ldap_resolver_timeout
+#### auth_ldap
 
-* Syntax: auth_ldap_resolver_timeout time;
-* Default: auth_ldap_resolver_timeout 10s;
-* Context: http
+> **Syntax:** `auth_ldap realm | off;`
+> **Default:** `--`
+> **Context:** `http, server, location, limit_except`
 
-Resolver requests timeout (see <https://nginx.org/en/docs/syntax.html> for time intervals syntax).
+Enables LDAP authentication with the given realm string (shown in browser auth dialog).
 
-### ldap_server
+#### auth_ldap_servers
 
-* Syntax: ldap_server _name_ { ... }
-* Default: none
-* Context: http
+> **Syntax:** `auth_ldap_servers name [name ...];`
+> **Default:** `--`
+> **Context:** `http, server, location, limit_except`
 
-## Configuration parameters for the `ldap_server` block
+Selects which `ldap_server` definitions to use. Multiple servers are tried in order (failover).
 
-### url
+### `ldap_server` block
 
-* Syntax: url _url_;
-* Default: --
-* Context: `ldap_server` block
+#### url
 
-url format: ldap[s]://host[:port]/dn?attrs?scope?filter[?exts]
+> **Syntax:** `url ldap[s]://host[:port]/base_dn?attr?scope?filter;`
+> **Default:** `--`
+> **Required:** yes
 
-### binddn
+LDAP server URL. Format: `ldap[s]://host[:port]/dn?attrs?scope?filter[?exts]`.
 
-* Syntax: binddn _dn_;
-* Default: --
-* Context: `ldap_server` block
+#### binddn
 
-The DN for the initial bind
+> **Syntax:** `binddn dn;`
+> **Default:** `--`
 
-### binddn_passwd
+DN for the initial (master) bind.
 
-* Syntax: binddn_passwd _password_ [text | base64 | hex];
-* Default: --
-* Context: `ldap_server` block
+#### binddn_passwd
 
-The initial bind password. can be encoded in clear text (the default) or be encoded in base64 or HEX representation
+> **Syntax:** `binddn_passwd password [text | base64 | hex];`
+> **Default:** `--`
 
-### group_attribute
+Password for the master bind. Supports `text` (default), `base64`, or `hex` encoding.
 
-* Syntax: group attr;
-* Default: --
-* Context: `ldap_server` block
+#### stateless
 
-### group_attribute_is_dn
+> **Syntax:** `stateless on | off;`
+> **Default:** `on`
 
-* Syntax: group_attribute_is_dn on | off;
-* Default: group_attribute_is_dn off;
-* Context: `ldap_server` block
+`on`: Connect on each request, close after use. No persistent connections.
+`off`: Pre-establish persistent connections at startup (pool mode). Use `connections` to set pool size.
 
-Tell to search for full DN in member object.
+#### connections
 
-### require
+> **Syntax:** `connections count;`
+> **Default:** `1`
+> **Context:** `ldap_server`
 
-* Syntax: require valid_user | user | group;
-* Default: --;
-* Context: `ldap_server` block
+Number of parallel connections to this LDAP server (pool mode only, `stateless off`).
 
-### satisfy
+#### set_auth_header
 
-* Syntax: satisfy all | any;
-* Default: --;
-* Context: `ldap_server` block
+> **Syntax:** `set_auth_header name value;`
+> **Default:** `--`
+> **Context:** `ldap_server`
 
-### max_down_retries
+Injects an HTTP response header on successful authentication. `value` supports nginx variables (`$remote_user`, `$http_*`, etc.). Repeatable.
 
-* Syntax: max_down_retries _number_;
-* Default: max_down_retries 0;
-* Context: `ldap_server` block
-
-Retry count for attempting to reconnect to an LDAP server if it is considered
-"DOWN".  This may happen if a KEEP-ALIVE connection to an LDAP server times
-out or is terminated by the server end after some amount of time.  
-
-This can usually help with the following error:
-
-```text
-http_auth_ldap: ldap_result() failed (-1: Can't contact LDAP server)
+```nginx
+set_auth_header X-Auth-User $remote_user;
+set_auth_header X-Auth-Role viewer;
+set_auth_header X-Request-ID $request_id;
 ```
 
-### ssl_check_cert
+#### require
 
-* Syntax: ssl_check_cert on | chain | off;
-* Default: ssl_check_cert off;
-* Context: `ldap_server` block
+> **Syntax:** `require valid_user [dn] | require user dn | require group dn;`
+> **Default:** `--`
 
-Verify the remote certificate for LDAPs connections. If disabled, any remote certificate will be
-accepted which exposes you to possible man-in-the-middle attacks. Note that the server's
-certificate will need to be signed by a proper CA trusted by your system if this is enabled.
-See below how to trust CAs without installing them system-wide.
+- `require valid_user` — any valid LDAP user passes
+- `require valid_user dn_template` — use `dn_template` as the user DN (nginx variables supported)
+- `require user dn` — user DN must match (repeatable)
+- `require group dn` — user must belong to this group (repeatable)
 
-This options needs OpenSSL >= 1.0.2; it is unavailable if compiled with older versions.
+#### satisfy
 
-When `chain` is given, verify cert chain but not hostname/IP in SAN
+> **Syntax:** `satisfy all | any;`
+> **Default:** `--`
 
-### ssl_ca_file
+`all`: all `require` rules must match.
+`any`: any single `require` rule match is sufficient.
 
-* Syntax: ssl_ca_file _file-path_;
-* Default: --;
-* Context: `ldap_server` block
+#### group_attribute
 
-Trust the CA certificate in this file (see ssl_check_cert above).
+> **Syntax:** `group_attribute attr;`
+> **Default:** `--`
 
-### ssl_ca_dir
+LDAP attribute containing group members (e.g. `member`, `uniqueMember`).
 
-* Syntax: ssl_ca_file _dir-path_;
-* Default: --;
-* Context: `ldap_server` block
+#### group_attribute_is_dn
 
-Trust all CA certificates in this directory (see ssl_check_cert above).
+> **Syntax:** `group_attribute_is_dn on | off;`
+> **Default:** `off`
 
-Note that you need to provide hash-based symlinks in the directory for this to work;
-you'll basically need to run OpenSSL's c_rehash command in this directory.
+If `on`, the user's full DN is used when checking group membership. If `off`, just the username.
 
-### referral
+#### search_attributes
 
-* Syntax: referral on | off;
-* Default: referral on;
-* Context: `ldap_server` block
+> **Syntax:** `search_attributes attr1 [attr2 ... attrN];`
+> **Default:** `--`
 
-LDAP library default is on. This option disables usage of referral messages from
-LDAP server. Usefull for authenticating against read only AD server without access
-to read write.
+LDAP attributes to fetch during the user search. Each value is injected as an HTTP response header with the configured prefix.
 
-### attribute_header_prefix
+#### attribute_header_prefix
 
-* Syntax: attribute_header_prefix _string_;
-* Default: attribute_header_prefix X-LDAP-ATTRS-;
-* Context: `ldap_server` block
+> **Syntax:** `attribute_header_prefix string;`
+> **Default:** `X-LDAP-ATTR-`
 
-The prefix for the HEADER names used to carry the feteched attributes (default: "X-LDAP-ATTRS-")
+Prefix for response headers carrying fetched LDAP attributes. Example: with prefix `X-LDAP-ATTR-` and attribute `mail`, the header is `X-LDAP-ATTR-mail`.
 
-### search_attributes
+#### referral
 
-* Syntax: search_attributes _attr1_ [ [ _attr2_ ] ... [ _attrN_ ] ];
-* Default: --
-* Context: `ldap_server` block
+> **Syntax:** `referral on | off;`
+> **Default:** `on`
 
-Space delimited list of LDAP attribute descriptions to include in the search (require valid-user or require user). Each attribute value will be return as a HTTP header (<attribute_header_prefix><search_attribute>) in the authentication response.
+Enable or disable LDAP referral following.
 
-### reconnect_timeout
+#### ssl_check_cert
 
-* Syntax: reconnect_timeout _timespec_;
-* Default: reconnect_timeout 10s;
-* Context: `ldap_server` block
+> **Syntax:** `ssl_check_cert on | full | chain | off;`
+> **Default:** `off`
 
-The delay before reconnection attempts (see <https://nginx.org/en/docs/syntax.html> for _timespec_ syntax)
+Verify the remote certificate for LDAPS connections. Requires OpenSSL >= 1.0.2.
+- `on` / `full`: verify chain + hostname
+- `chain`: verify chain only (skip hostname check)
+- `off`: no verification
 
-### connections
+#### ssl_ca_file
 
-* Syntax: connections _count_;
-* Default: connections 1;
-* Context: `ldap_server` block
+> **Syntax:** `ssl_ca_file path;`
+> **Default:** `--`
 
-The number of connections to the server use in //
+Path to CA certificate file for LDAPS verification.
 
-### clean_on_timeout
+#### ssl_ca_dir
 
-* Syntax: clean_on_timeout on | off;
-* Default: clean_on_timeout off;
-* Context: `ldap_server` block
+> **Syntax:** `ssl_ca_dir path;`
+> **Default:** `--`
 
-Tell the module to shutdown an re-connect a LDAP server connection after a
-send timeout detected (instead of just marking the connection as free again).
+Path to CA certificate directory (requires `c_rehash`).
+
+#### clean_on_timeout
+
+> **Syntax:** `clean_on_timeout on | off;`
+> **Default:** `off`
+
+If `on`, destroy and reconnect an LDAP connection after a request timeout instead of returning it to the pool.
+
+#### max_down_retries
+
+> **Syntax:** `max_down_retries number;`
+> **Default:** `0`
+
+Number of reconnection attempts after `LDAP_SERVER_DOWN` errors before giving up.
+
+#### Timeouts
+
+All accept nginx time syntax (`s`, `m`, `h`, `d`, etc.):
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `connect_timeout` | `10s` | TCP connect + TLS handshake |
+| `bind_timeout` | `5s` | LDAP bind response wait |
+| `request_timeout` | `10s` | Total auth flow (search + bind + rebind) |
+| `reconnect_timeout` | `10s` | Delay before reconnection (pool mode) |
+
+## Testing
+
+```bash
+make test-unit       # Run C unit tests (24 tests)
+make check-leaks     # Run with valgrind leak detection
+make test            # Run all tests
+make clean           # Clean build artifacts
+```
+
+Test files:
+- `test/unit/test_utils.c` — utility function tests (sanitize, hex decode, array operations)
+- `test/unit/test_cache.c` — cache hit/miss/eviction/expiration/attribute tests
+- `t/001-auth.t` — integration tests with MockLDAP and valgrind checks
+- `t/lib/MockLDAP.pm` — minimal mock LDAP server for testing
+- `.github/workflows/test.yml` — CI pipeline
