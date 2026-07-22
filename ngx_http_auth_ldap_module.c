@@ -929,12 +929,8 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
             | NGX_SSL_TLSv1_3
 #endif
             ;
-        if (halmcf->ssl.ctx == NULL) {
-            if (ngx_ssl_create(&halmcf->ssl, protos, halmcf) != NGX_OK) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "http_auth_ldap: ngx_ssl_create() failed");
-                return NGX_CONF_ERROR;
-            }
+        if (halmcf->ssl.ctx == NULL && ngx_ssl_create(&halmcf->ssl, protos, halmcf) != NGX_OK) {
+            return NGX_CONF_ERROR;
         }
         return NGX_CONF_OK;
 #endif
