@@ -321,6 +321,7 @@ static ngx_int_t ngx_http_auth_ldap_init_worker(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_auth_ldap_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle);
 static void ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c, int retry_asap);
+static void ngx_http_auth_ldap_reply_connection(ngx_http_auth_ldap_connection_t *c, int error_code, char* error_msg);
 static void ngx_http_auth_ldap_set_pending_reconnection(ngx_http_auth_ldap_connection_t *c, ngx_msec_t reconnect_delay);
 static void ngx_http_auth_ldap_read_handler(ngx_event_t *rev);
 static void ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c);
@@ -2274,10 +2275,10 @@ ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c)
             c->cnx_idx, &c->server->alias);
 
     // Clear and free any previous addrs from parsed_url, so that we can resolve again the LDAP server hostname
-    my_free_addrs_from_url(c->pool, &c->server->parsed_url);
-    
+    my_free_addrs_from_url(c->main_cnf->cnf_pool, &c->server->parsed_url);
+
     c->server->parsed_url.no_resolve = 0; // Try to resolve this time
-    if (ngx_parse_url(c->pool, &c->server->parsed_url) != NGX_OK) {
+    if (ngx_parse_url(c->main_cnf->cnf_pool, &c->server->parsed_url) != NGX_OK) {
         ngx_log_error(NGX_LOG_WARN, c->log, 0,
                 "ngx_http_auth_ldap_connect: Hostname \"%V\" not found with system resolver, try with DNS",
                 &c->server->parsed_url.host);
