@@ -1556,7 +1556,6 @@ ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c, int retr
         ngx_http_auth_ldap_ctx_t *orphan_ctx = c->rctx;
         if (orphan_ctx != NULL) {
             orphan_ctx->c = NULL;
-            ngx_http_auth_ldap_reply_connection(c, LDAP_SERVER_DOWN, "Connection closed");
         }
     }
     c->rctx = NULL;
