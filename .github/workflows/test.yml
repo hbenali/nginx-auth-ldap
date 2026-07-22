@@ -1,0 +1,82 @@
+name: Test nginx-auth-ldap
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libldap2-dev valgrind
+
+      - name: Build unit tests
+        run: make test-unit
+
+      - name: Run valgrind leak check
+        run: make check-leaks
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libldap2-dev libssl-dev libpcre3-dev zlib1g-dev \
+            build-essential wget curl valgrind libtest-base-perl
+
+      - name: Download and compile nginx
+        run: |
+          NGINX_VERSION=1.24.0
+          wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
+          tar xzf nginx-${NGINX_VERSION}.tar.gz
+          cd nginx-${NGINX_VERSION}
+          ./configure --add-module=${{ github.workspace }} \
+            --with-debug \
+            --prefix=/tmp/nginx-test \
+            --without-http_rewrite_module \
+            --without-http_gzip_module
+          make -j$(nproc)
+          echo "NGINX_BIN=$PWD/objs/nginx" >> $GITHUB_ENV
+
+      - name: Verify module
+        run: |
+          ${{ env.NGINX_BIN }} -V 2>&1 | grep ngx_http_auth_ldap_module
+
+      - name: Run unit tests
+        run: make test-unit
+
+      - name: Run integration tests
+        run: |
+          export TEST_NGINX_BINARY=${{ env.NGINX_BIN }}
+          perl t/001-auth.t
+        continue-on-error: true
+
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check compilation warnings
+        run: |
+          NGINX_VERSION=1.24.0
+          wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
+          tar xzf nginx-${NGINX_VERSION}.tar.gz
+          cd nginx-${NGINX_VERSION}
+          ./configure --add-module=${{ github.workspace }} \
+            --with-debug \
+            --prefix=/tmp/nginx-test \
+            --with-cc-opt="-Wall -Wextra -Werror" \
+            --without-http_rewrite_module \
+            --without-http_gzip_module
+          make -j$(nproc) 2>&1 | tee build.log
+          ! grep -i "error:" build.log
