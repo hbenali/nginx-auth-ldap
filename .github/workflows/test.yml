@@ -163,4 +163,3 @@ jobs:
         run: |
           export TEST_NGINX_BINARY=${{ env.NGINX_BIN }}
           perl t/001-auth.t
-        continue-on-error: true
