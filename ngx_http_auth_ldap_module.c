@@ -3150,6 +3150,12 @@ ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
         }
     }
 
+    /* The DN of the group entry found by the previous search must not leak into the
+     * next one: read_handler only sets ctx->dn when an entry is returned, so a stale
+     * value made a later group look matched (satisfy all let non-members through). */
+    ctx->dn.data = NULL;
+    ctx->dn.len = 0;
+
     /* Check next group */
     if (ctx->iteration >= ctx->server->require_group->nelts) {
         /* No more groups */
