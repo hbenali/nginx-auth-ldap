@@ -87,6 +87,9 @@ echo "=== auth cache (stateless and pool): LDAP stopped, cached creds must still
 for mode in st pool; do start $mode 1 cache
   t "[$mode] cache prime alice" /valid alice:alicepw 200; t "[$mode] cache prime bad pw" /valid alice:bad "$DENY"
   docker stop ldapsrv >/dev/null
+  h=$(docker exec ngt curl -si -u alice:alicepw localhost/valid | tr -d '\r' | grep -i '^x-ldap\|^x-auth' | sort | tr '\n' ' ')
+  if [[ "$h" == *"X-LDAP-givenName: Alice"* && "$h" == *"X-LDAP-mail: alice@example.org"* ]]; then PASS=$((PASS+1)); echo "  ok   [$mode] attributes served from the cache: $h"; else FAILN=$((FAILN+1)); echo "  FAIL [$mode] cached attributes: $h"; fi
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do code -u alice:alicepw localhost/valid >/dev/null; done
   t "[$mode] cached alice, LDAP down" /valid alice:alicepw 200; t "[$mode] bad pw, LDAP down" /valid alice:bad '401|403|503'; t "[$mode] uncached bob, LDAP down" /valid bob:bobpw 503
   docker start ldapsrv >/dev/null; for i in $(seq 40); do docker exec ldapsrv ldapsearch -x -H ldap://localhost -b dc=example,dc=org -D cn=admin,dc=example,dc=org -w admin dn >/dev/null 2>&1 && break; sleep 2; done; sleep 12
   echo "  crashes: $(docker logs ngt 2>&1 | grep -c 'exited on signal')"

@@ -1485,7 +1485,6 @@ ngx_http_auth_ldap_check_cache(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
 {
     ngx_http_auth_ldap_cache_elt_t *elt;
     ngx_md5_t md5ctx;
-    ngx_msec_t time_limit;
     ngx_uint_t i;
 
     ctx->cache_small_hash = ngx_murmur_hash2(r->headers_in.user.data, r->headers_in.user.len) ^ (uint32_t) (ngx_uint_t) server;
@@ -1504,10 +1503,11 @@ ngx_http_auth_ldap_check_cache(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
     ctx->cache_bucket = &cache->buckets[ctx->cache_small_hash % cache->num_buckets];
 
     elt = ctx->cache_bucket;
-    time_limit = ngx_current_msec - cache->expiration_time;
     for (i = 0; i < cache->elts_per_bucket; i++, elt++) {
+        /* Compare the age: "now - ttl" underflows in the first ttl after the start. */
         if (elt->small_hash == ctx->cache_small_hash &&
-                elt->time > time_limit &&
+                elt->time != 0 &&
+                ngx_current_msec - elt->time < cache->expiration_time &&
                 memcmp(elt->big_hash, ctx->cache_big_hash, 16) == 0) {
             if (elt->outcome == OUTCOME_ALLOW || elt->outcome == OUTCOME_CACHED_ALLOW) {
                 /* Restore the cached attributes to the current context */
@@ -1548,11 +1548,23 @@ ngx_http_auth_ldap_update_cache(ngx_http_auth_ldap_ctx_t *ctx,
     ngx_http_auth_ldap_cache_elt_t *elt, *oldest_elt;
     ngx_uint_t i;
 
-    elt = ctx->cache_bucket;
-    oldest_elt = elt;
-    for (i = 1; i < cache->elts_per_bucket; i++, elt++) {
-        if (elt->time < oldest_elt->time) {
+    /* Reuse the entry of this very login (an expired one, or another outcome), else the
+     * oldest of the bucket; every entry of the bucket is considered. */
+    oldest_elt = NULL;
+    for (i = 0, elt = ctx->cache_bucket; i < cache->elts_per_bucket; i++, elt++) {
+        if (elt->small_hash == ctx->cache_small_hash && elt->time != 0
+            && memcmp(elt->big_hash, ctx->cache_big_hash, 16) == 0)
+        {
             oldest_elt = elt;
+            break;
+        }
+    }
+    if (oldest_elt == NULL) {
+        oldest_elt = ctx->cache_bucket;
+        for (i = 1, elt = ctx->cache_bucket + 1; i < cache->elts_per_bucket; i++, elt++) {
+            if (elt->time < oldest_elt->time) {
+                oldest_elt = elt;
+            }
         }
     }
 
@@ -1560,7 +1572,13 @@ ngx_http_auth_ldap_update_cache(ngx_http_auth_ldap_ctx_t *ctx,
     oldest_elt->outcome = outcome;
     oldest_elt->small_hash = ctx->cache_small_hash;
     ngx_memcpy(oldest_elt->big_hash, ctx->cache_big_hash, 16);
-    /* save (copy) each attribute from the context to the cache */
+    /* save (copy) each attribute from the context to the cache; the strings of the entry
+     * that is overwritten are freed, they are not taken from a pool that lives as long as nginx */
+    for (i = 0; i < oldest_elt->attributes.nelts; i++) {
+        ldap_search_attribute_t *old = (ldap_search_attribute_t *) oldest_elt->attributes.elts + i;
+        ngx_free(old->attr_name.data);
+        ngx_free(old->attr_value.data);
+    }
     oldest_elt->attributes.nelts = 0;
     for (i = 0; i < ctx->attributes.nelts; i++) {
         ldap_search_attribute_t *src_attr = ((ldap_search_attribute_t *)ctx->attributes.elts + i);
@@ -1570,13 +1588,13 @@ ngx_http_auth_ldap_update_cache(ngx_http_auth_ldap_ctx_t *ctx,
         }
         /* Deep-copy attribute strings into cache pool */
         cache_attr->attr_name.len = src_attr->attr_name.len;
-        cache_attr->attr_name.data = ngx_pnalloc(cache->pool, src_attr->attr_name.len + 1);
+        cache_attr->attr_name.data = ngx_alloc(src_attr->attr_name.len + 1, ctx->r->connection->log);
         if (cache_attr->attr_name.data != NULL) {
             ngx_memcpy(cache_attr->attr_name.data, src_attr->attr_name.data, src_attr->attr_name.len);
             cache_attr->attr_name.data[src_attr->attr_name.len] = '\0';
         }
         cache_attr->attr_value.len = src_attr->attr_value.len;
-        cache_attr->attr_value.data = ngx_pnalloc(cache->pool, src_attr->attr_value.len + 1);
+        cache_attr->attr_value.data = ngx_alloc(src_attr->attr_value.len + 1, ctx->r->connection->log);
         if (cache_attr->attr_value.data != NULL) {
             ngx_memcpy(cache_attr->attr_value.data, src_attr->attr_value.data, src_attr->attr_value.len);
             cache_attr->attr_value.data[src_attr->attr_value.len] = '\0';
