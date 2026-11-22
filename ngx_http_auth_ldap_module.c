@@ -1982,35 +1982,55 @@ ngx_http_auth_ldap_ssl_handshake(ngx_http_auth_ldap_connection_t *c)
 
     ngx_http_auth_ldap_ssl_callback callback;
     if (c->server->ssl_check_cert) {
-      // load CA certificates: custom ones if specified, default ones instead
-      if (c->server->ssl_ca_file.data || c->server->ssl_ca_dir.data) {
+      /* Load the CA certificates into a store owned by this connection. The SSL_CTX is shared by
+       * every ldap_server, so adding CAs to it made a CA trusted by one server trusted by all. */
 #if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-        int setcode = SSL_CTX_load_verify_locations(transport->ssl->session_ctx,
-          (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data));
-#else
-        int setcode = SSL_CTX_load_verify_locations(transport->ssl->connection->ctx,
-          (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data));
-#endif
-        if (setcode != 1) {
+      {
+        X509_STORE *store = X509_STORE_new();
+        int ok = (store != NULL);
+        if (ok && (c->server->ssl_ca_file.data || c->server->ssl_ca_dir.data)) {
+          if (X509_STORE_load_locations(store, (char*)(c->server->ssl_ca_file.data),
+                                        (char*)(c->server->ssl_ca_dir.data)) != 1) {
+            unsigned long error_code = ERR_get_error();
+            char *error_msg = ERR_error_string(error_code, NULL);
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+              "http_auth_ldap: SSL initialization failed. Could not set custom CA certificate location. "
+              "Error: %lu, %s", error_code, error_msg);
+          }
+        }
+        if (ok && !(c->server->ssl_ca_file.data || c->server->ssl_ca_dir.data)
+            && X509_STORE_set_default_paths(store) != 1) {
           unsigned long error_code = ERR_get_error();
           char *error_msg = ERR_error_string(error_code, NULL);
           ngx_log_error(NGX_LOG_ERR, c->log, 0,
-            "http_auth_ldap: SSL initialization failed. Could not set custom CA certificate location. "
+            "http_auth_ldap: SSL initialization failed. Could not use default CA certificate location. "
             "Error: %lu, %s", error_code, error_msg);
         }
+        if (!ok || SSL_set1_verify_cert_store(transport->ssl->connection, store) != 1) {
+          ngx_log_error(NGX_LOG_ERR, c->log, 0, "http_auth_ldap: SSL initialization failed. Could not set the certificate store");
+        }
+        if (store != NULL) {
+          X509_STORE_free(store);
+        }
       }
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-      int setcode = SSL_CTX_set_default_verify_paths(transport->ssl->session_ctx);
 #else
-      int setcode = SSL_CTX_set_default_verify_paths(transport->ssl->connection->ctx);
-#endif
-      if (setcode != 1) {
+      /* OpenSSL < 1.1.0: no per-connection store here, fall back on the shared context. */
+      if (c->server->ssl_ca_file.data || c->server->ssl_ca_dir.data) {
+        if (SSL_CTX_load_verify_locations(transport->ssl->connection->ctx,
+              (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data)) != 1) {
+          unsigned long error_code = ERR_get_error();
+          ngx_log_error(NGX_LOG_ERR, c->log, 0,
+            "http_auth_ldap: SSL initialization failed. Could not set custom CA certificate location. "
+            "Error: %lu, %s", error_code, ERR_error_string(error_code, NULL));
+        }
+      }
+      if (SSL_CTX_set_default_verify_paths(transport->ssl->connection->ctx) != 1) {
         unsigned long error_code = ERR_get_error();
-        char *error_msg = ERR_error_string(error_code, NULL);
         ngx_log_error(NGX_LOG_ERR, c->log, 0,
           "http_auth_ldap: SSL initialization failed. Could not use default CA certificate location. "
-          "Error: %lu, %s", error_code, error_msg);
+          "Error: %lu, %s", error_code, ERR_error_string(error_code, NULL));
       }
+#endif
 
       // use validating version of next function
       callback = &ngx_http_auth_ldap_ssl_handshake_validating_handler;
