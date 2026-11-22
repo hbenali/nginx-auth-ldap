@@ -2264,6 +2264,12 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
 
         ldap_memfree(error_msg);
         ldap_msgfree(result);
+
+        /* The reply may have completed the request synchronously and closed
+         * this connection (stateless mode): c->ld is gone, stop reading. */
+        if (c->ld == NULL || c->state == STATE_DISCONNECTED) {
+            return;
+        }
     }
 
     if (ngx_handle_read_event(rev, 0) != NGX_OK) {
