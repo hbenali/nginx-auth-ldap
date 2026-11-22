@@ -323,18 +323,39 @@ All accept nginx time syntax (`s`, `m`, `h`, `d`, etc.):
 | `request_timeout` | `10s` | Total auth flow (search + bind + rebind) |
 | `reconnect_timeout` | `10s` | Delay before reconnection (pool mode) |
 
+## Behaviour when LDAP cannot answer
+
+A request answers `503 Service Unavailable` (never `401`) when no `ldap_server` of the location allows the user and at least one of them could not decide: the connection failed or broke, the server timed out, or it answered busy or unavailable. Such an outcome is not cached. In stateless mode a failed connect moves on to the next server of `auth_ldap_servers` at once; in pool mode the request waits for `request_timeout` first.
+
+A wrong password, an unknown user and a failed `require` are `401`, and are cached when the cache is on.
+
+## Configuration checks
+
+`nginx -t` refuses an `ldap_server` block with an unknown directive, a wrong number of arguments, a flag that is not `on`/`off`, a url without host, with a port outside 1-65535 or with a filter that is not one parenthesized filter, an unknown `require` kind, `require group` without `group_attribute`, `binddn` without a password, a missing `url`, or a name used twice.
+
+## Security notes
+
+- The login is escaped in the user and group search filters (RFC 4515), and `$remote_user` expands escaped as an RDN value (RFC 4514) in a `require valid_user` DN template.
+- `require user` compares DNs as DNs (case and spacing do not matter).
+- With `ssl_check_cert full` a host name in the url is matched against the DNS subjectAltNames and an IP address against the IP ones, never against the subject CN. The host name is sent as SNI.
+- Each `ldap_server` trusts only its own `ssl_ca_file` / `ssl_ca_dir`.
+
 ## Testing
 
 ```bash
 make test-unit       # Run C unit tests (24 tests)
 make check-leaks     # Run with valgrind leak detection
 make test            # Run all tests
+make test-docker IMG=<image>   # nginx + this module against a real OpenLDAP (needs Docker)
 make clean           # Clean build artifacts
 ```
+
+`make test-docker` runs `test/integration/config.sh` (`nginx -t` on good and bad blocks) and `test/integration/run.sh`: stateless and pool mode, `require`/`satisfy`, LDAPS verification (own CA), failover, outages (stopped and paused server), LDAP injection attempts, response headers, the cache, and four workers under load. The image needs only nginx (with the module) and curl.
 
 Test files:
 - `test/unit/test_utils.c` — utility function tests (sanitize, hex decode, array operations)
 - `test/unit/test_cache.c` — cache hit/miss/eviction/expiration/attribute tests
-- `t/001-auth.t` — integration tests with MockLDAP and valgrind checks
-- `t/lib/MockLDAP.pm` — minimal mock LDAP server for testing
+- `test/integration/` — Docker suite against OpenLDAP (`run.sh`, `config.sh`)
+- `t/001-auth.t` — Perl wrapper for the unit tests and valgrind checks
+- `t/lib/MockLDAP.pm` — minimal mock LDAP server
 - `.github/workflows/test.yml` — CI pipeline

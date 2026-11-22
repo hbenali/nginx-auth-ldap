@@ -113,102 +113,12 @@ subtest 'valgrind leak check: test_cache' => sub {
 # Integration tests (full nginx + LDAP, requires compiled module)
 # ============================================================================
 
-subtest 'integration: auth_ldap with test LDAP' => sub {
+subtest 'integration: auth_ldap with a real LDAP server' => sub {
+    # The old check here could not pass: "return 200" runs in the rewrite phase, before the
+    # access phase where auth_ldap runs, and no LDAP server was started. The real thing is
+    # test/integration/run.sh (make test-docker IMG=<image>): nginx against OpenLDAP.
     SKIP: {
-        skip "nginx not compiled with ngx_http_auth_ldap_module", 3 unless $HaveNginx;
-
-        my $workdir = tempdir(CLEANUP => 1);
-        make_path("$workdir/logs");
-        make_path("$workdir/conf");
-
-        # Write nginx config
-        open(my $cf, '>', "$workdir/conf/nginx.conf") or die $!;
-        print $cf <<"NGINX_CONF";
-daemon off;
-worker_processes 1;
-error_log $workdir/logs/error.log debug;
-pid $workdir/nginx.pid;
-
-events {
-    worker_connections 64;
-}
-
-http {
-    access_log $workdir/logs/access.log;
-
-    ldap_server test_ldap {
-        url ldap://127.0.0.1:8389/ou=users,dc=example,dc=com?uid?sub?(objectClass=*);
-        binddn "cn=admin,dc=example,dc=com";
-        binddn_passwd "adminpass";
-        group_attribute member;
-        group_attribute_is_dn on;
-        require valid_user;
-        satisfy all;
-        search_attributes mail givenName sn;
-        connections 1;
-        connect_timeout 3s;
-        bind_timeout 3s;
-        request_timeout 5s;
-    }
-
-    server {
-        listen 19999;
-        server_name localhost;
-
-        auth_ldap "Restricted Area";
-        auth_ldap_servers test_ldap;
-
-        location / {
-            return 200 "OK - authenticated\n";
-        }
-    }
-}
-NGINX_CONF
-        close($cf);
-
-        # Start nginx
-        my $nginx_pid = fork();
-        if (!defined $nginx_pid) {
-            fail("Cannot fork nginx process");
-            return;
-        }
-
-        if ($nginx_pid == 0) {
-            # Child: nginx
-            exec($NginxBinary, '-c', "$workdir/conf/nginx.conf", '-p', $workdir);
-            exit(1);
-        }
-
-        # Give nginx a moment to start
-        sleep 2;
-
-        # Verify nginx is running
-        my $alive = kill(0, $nginx_pid);
-        if (!$alive) {
-            fail("nginx failed to start");
-            return;
-        }
-
-        # Test 1: No auth -> 401
-        my $response = `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19999/ 2>/dev/null`;
-        chomp $response;
-        is($response, '401', "No auth returns 401");
-
-        # Test 2: Valid auth -> 200 (depends on LDAP server)
-        $response = `curl -s -o /dev/null -w '%{http_code}' -u testuser:testpass http://127.0.0.1:19999/ 2>/dev/null`;
-        chomp $response;
-        # This will only pass with a real LDAP server - mark as TODO
-        TODO: {
-            local $TODO = "Requires running LDAP server at port 8389";
-            is($response, '200', "Valid auth returns 200");
-        }
-
-        # Test 3: Health check - nginx still running
-        ok(kill(0, $nginx_pid), "nginx process still alive after requests");
-
-        # Stop nginx
-        kill('TERM', $nginx_pid);
-        waitpid($nginx_pid, 0);
+        skip "run 'make test-docker IMG=<image with nginx + this module>' (needs Docker)", 1;
     }
 };
 
