@@ -11,7 +11,7 @@ NGINX_SRC_DIR ?= /usr/src/nginx
 NGINX_VER ?= $(shell nginx -v 2>&1 | sed 's/.*\/\([0-9.]*\).*/\1/')
 TEST_DIR = t
 
-.PHONY: all test-unit test-integration test clean help check-leaks
+.PHONY: all test-unit test-integration test-docker test clean help check-leaks
 
 all: test-unit
 
@@ -19,6 +19,7 @@ help:
 	@echo "Targets:"
 	@echo "  test-unit       Build and run unit tests"
 	@echo "  test-integration Run integration tests (requires Test::Nginx)"
+	@echo "  test-docker     Docker integration tests against OpenLDAP (IMG=image)"
 	@echo "  test            Run all tests (unit + integration)"
 	@echo "  check-leaks     Run memory leak checks with valgrind"
 	@echo "  clean           Clean build artifacts"
@@ -47,6 +48,12 @@ test-integration:
 	else \
 		for t in $(TEST_DIR)/*.t; do perl $$t || exit 1; done; \
 	fi
+
+# --- Docker integration tests (real OpenLDAP, stateless + pool, LDAPS, cache, outages) ---
+# make test-docker IMG=<image whose nginx includes this module>
+test-docker:
+	@test -n "$(IMG)" || { echo "usage: make test-docker IMG=<image with nginx + this module>"; exit 2; }
+	IMG=$(IMG) test/integration/run.sh
 
 # --- Full test suite ---
 
