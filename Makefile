@@ -53,6 +53,7 @@ test-integration:
 # make test-docker IMG=<image whose nginx includes this module>
 test-docker:
 	@test -n "$(IMG)" || { echo "usage: make test-docker IMG=<image with nginx + this module>"; exit 2; }
+	IMG=$(IMG) test/integration/config.sh
 	IMG=$(IMG) test/integration/run.sh
 
 # --- Full test suite ---

@@ -541,6 +541,99 @@ my_hex_decode(ngx_str_t *dst, ngx_str_t *src)
 /**
  * Reads ldap_server block and sets ngx_http_auth_ldap_ldap_server as a handler of each conf value
  */
+/* Directives of an ldap_server block with the number of arguments (name included) they take. */
+static struct {
+    const char *name;
+    ngx_uint_t  min, max;       /* max 0: any number */
+} ngx_http_auth_ldap_server_directives[] = {
+    { "url", 2, 2 }, { "binddn", 2, 2 }, { "binddn_passwd", 2, 3 },
+    { "group_attribute", 2, 2 }, { "group_attribute_is_dn", 2, 2 },
+    { "search_attributes", 2, 0 }, { "attribute_header_prefix", 2, 2 },
+    { "require", 2, 3 }, { "satisfy", 2, 2 }, { "referral", 2, 2 },
+    { "clean_on_timeout", 2, 2 }, { "stateless", 2, 2 },
+    { "set_auth_header", 3, 3 }, { "max_down_retries", 2, 2 }, { "connections", 2, 2 },
+    { "ssl_check_cert", 2, 2 }, { "ssl_ca_dir", 2, 2 }, { "ssl_ca_file", 2, 2 },
+    { "connect_timeout", 2, 2 }, { "reconnect_timeout", 2, 2 },
+    { "bind_timeout", 2, 2 }, { "request_timeout", 2, 2 },
+    { "include", 2, 2 },
+    { NULL, 0, 0 }
+};
+
+/* Reject a directive that ldap_server does not know or that has the wrong number of arguments. */
+static ngx_int_t
+ngx_http_auth_ldap_check_directive(ngx_conf_t *cf)
+{
+    ngx_str_t *value = cf->args->elts;
+    ngx_uint_t i;
+
+    for (i = 0; ngx_http_auth_ldap_server_directives[i].name != NULL; i++) {
+        if (ngx_strcmp(value[0].data, ngx_http_auth_ldap_server_directives[i].name) == 0) {
+            if (cf->args->nelts < ngx_http_auth_ldap_server_directives[i].min
+                || (ngx_http_auth_ldap_server_directives[i].max != 0
+                    && cf->args->nelts > ngx_http_auth_ldap_server_directives[i].max))
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "http_auth_ldap: invalid number of arguments in \"%V\" directive", &value[0]);
+                return NGX_ERROR;
+            }
+            return NGX_OK;
+        }
+    }
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        "http_auth_ldap: unknown directive \"%V\" in ldap_server", &value[0]);
+    return NGX_ERROR;
+}
+
+/* on | off */
+static char *
+ngx_http_auth_ldap_parse_flag(ngx_conf_t *cf, ngx_flag_t *flag)
+{
+    ngx_str_t *value = cf->args->elts;
+
+    if (ngx_strcasecmp(value[1].data, (u_char *) "on") == 0) {
+        *flag = 1;
+    } else if (ngx_strcasecmp(value[1].data, (u_char *) "off") == 0) {
+        *flag = 0;
+    } else {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: invalid value \"%V\" in \"%V\" directive, it must be \"on\" or \"off\"",
+            &value[1], &value[0]);
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+/* A filter of an ldap url must be one parenthesized filter: (...) */
+static ngx_int_t
+ngx_http_auth_ldap_check_filter(const char *filter)
+{
+    size_t i, n = ngx_strlen(filter);
+    ngx_uint_t depth = 0;
+
+    if (n < 3 || filter[0] != '(' || filter[n - 1] != ')') {
+        return NGX_ERROR;
+    }
+    for (i = 0; i < n; i++) {
+        if (filter[i] == '\\' && i + 1 < n) {
+            i++;                     /* escaped character */
+        } else if (filter[i] == '(') {
+            depth++;
+        } else if (filter[i] == ')') {
+            if (depth == 0) {
+                return NGX_ERROR;
+            }
+            depth--;
+            if (depth == 0 && i != n - 1) {
+                return NGX_ERROR;    /* a second top-level filter */
+            }
+        }
+    }
+
+    return depth == 0 ? NGX_OK : NGX_ERROR;
+}
+
 static char *
 ngx_http_auth_ldap_ldap_server_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -557,6 +650,18 @@ ngx_http_auth_ldap_ldap_server_block(ngx_conf_t *cf, ngx_command_t *cmd, void *c
     if (ngx_strlen(name.data) == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: Missing server name in ldap_server");
         return NGX_CONF_ERROR;
+    }
+
+    if (cnf->servers != NULL) {
+        ngx_http_auth_ldap_server_t *o = cnf->servers->elts;
+        ngx_uint_t k;
+        for (k = 0; k < cnf->servers->nelts; k++) {
+            if (o[k].alias.len == name.len && ngx_strcmp(o[k].alias.data, name.data) == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "http_auth_ldap: duplicate ldap_server \"%V\"", &name);
+                return NGX_CONF_ERROR;
+            }
+        }
     }
 
     if (cnf->servers == NULL) {  
@@ -597,6 +702,24 @@ ngx_http_auth_ldap_ldap_server_block(ngx_conf_t *cf, ngx_command_t *cmd, void *c
         return rv;
     }
 
+    /* The block is complete: check what depends on several directives. */
+    if (server->ludpp == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: ldap_server \"%V\" has no \"url\"", &name);
+        return NGX_CONF_ERROR;
+    }
+    if (server->require_group != NULL && server->group_attribute.data == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: ldap_server \"%V\" has \"require group\" but no \"group_attribute\"", &name);
+        return NGX_CONF_ERROR;
+    }
+    if (server->bind_dn.len != 0 && server->bind_dn_passwd.len == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: ldap_server \"%V\" has \"binddn\" without a password: "
+            "the server would take the bind for an anonymous one", &name);
+        return NGX_CONF_ERROR;
+    }
+
     return NGX_CONF_OK;
 }
 
@@ -626,7 +749,10 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
 
     value = cf->args->elts;
 
-    /* TODO: Add more validation */
+    if (ngx_http_auth_ldap_check_directive(cf) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
     if (ngx_strcmp(value[0].data, "url") == 0) {
         return ngx_http_auth_ldap_parse_url(cf, server);
     } else if (ngx_strcmp(value[0].data, "binddn") == 0) {
@@ -635,16 +761,16 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         return ngx_http_auth_ldap_parse_binddn_passwd(cf, server);
     } else if (ngx_strcmp(value[0].data, "group_attribute") == 0) {
         server->group_attribute = value[1];
-    } else if (ngx_strcmp(value[0].data, "group_attribute_is_dn") == 0 && ngx_strcmp(value[1].data, "on") == 0) {
-        server->group_attribute_dn = 1;
-    } else if (ngx_strcmp(value[0].data, "search_attributes") == 0 && cf->args->nelts >= 2) {
+    } else if (ngx_strcmp(value[0].data, "group_attribute_is_dn") == 0) {
+        return ngx_http_auth_ldap_parse_flag(cf, &server->group_attribute_dn);
+    } else if (ngx_strcmp(value[0].data, "search_attributes") == 0) {
         ngx_uint_t j, attrs_count = cf->args->nelts -1;
         server->attrs = ngx_palloc(cf->pool, (attrs_count + 1) * sizeof(char *));
         for (j = 0; j < attrs_count; j++) {
             server->attrs[j] = (char *)value[j + 1].data;
         }
         server->attrs[attrs_count] = NULL; // Last element of the list
-    } else if (ngx_strcmp(value[0].data, "attribute_header_prefix") == 0 && cf->args->nelts >= 2) {
+    } else if (ngx_strcmp(value[0].data, "attribute_header_prefix") == 0) {
         santitize_str(value[1].data, SANITIZE_NO_CONV); // The prefix is sanitized
         server->attribute_header_prefix = value[1];
     } else if (ngx_strcmp(value[0].data, "require") == 0) {
@@ -654,18 +780,10 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
     } else if (ngx_strcmp(value[0].data, "referral") == 0) {
         return ngx_http_auth_ldap_parse_referral(cf, server);
     } else if (ngx_strcmp(value[0].data, "clean_on_timeout") == 0) {
-        if (ngx_strcasecmp(value[1].data, (u_char *) "on") == 0) {
-            server->clean_on_timeout = 1;
-        } else {
-            server->clean_on_timeout = 0;
-        }
+        return ngx_http_auth_ldap_parse_flag(cf, &server->clean_on_timeout);
     } else if (ngx_strcmp(value[0].data, "stateless") == 0) {
-        if (ngx_strcasecmp(value[1].data, (u_char *) "on") == 0) {
-            server->stateless = 1;
-        } else {
-            server->stateless = 0;
-        }
-    } else if (ngx_strcmp(value[0].data, "set_auth_header") == 0 && cf->args->nelts >= 3) {
+        return ngx_http_auth_ldap_parse_flag(cf, &server->stateless);
+    } else if (ngx_strcmp(value[0].data, "set_auth_header") == 0) {
         ngx_http_auth_ldap_header_t *hdr;
         ngx_http_compile_complex_value_t ccv;
 
@@ -693,8 +811,8 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
     } else if (ngx_strcmp(value[0].data, "max_down_retries") == 0) {
         i = ngx_atoi(value[1].data, value[1].len);
         if (i == NGX_ERROR) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: 'max_down_retries' value must be an integer: using default of 0");
-            i = 0;
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: 'max_down_retries' value must be an integer");
+            return NGX_CONF_ERROR;
         }
         server->max_down_retries = i;
     } else if (ngx_strcmp(value[0].data, "connections") == 0) {
@@ -710,8 +828,12 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
             server->ssl_check_cert = SSL_CERT_VERIFY_FULL;
         } else if (ngx_strcmp(value[1].data, "chain") == 0) {
             server->ssl_check_cert = SSL_CERT_VERIFY_CHAIN;
-        } else {
+        } else if (ngx_strcmp(value[1].data, "off") == 0) {
             server->ssl_check_cert = SSL_CERT_VERIFY_OFF;
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "http_auth_ldap: invalid value \"%V\" in \"ssl_check_cert\", it must be on, full, chain or off", &value[1]);
+            return NGX_CONF_ERROR;
         }
         #else
 #if __GNUC__ > 4
@@ -913,6 +1035,27 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
         return NGX_CONF_ERROR;
     }
 
+    if (server->ludpp->lud_host == NULL || server->ludpp->lud_host[0] == '\0') {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: the url of ldap_server \"%V\" has no host",
+            &server->alias);
+        return NGX_CONF_ERROR;
+    }
+
+    if (server->ludpp->lud_port < 1 || server->ludpp->lud_port > 65535) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: invalid port %d in the url of ldap_server \"%V\"",
+            server->ludpp->lud_port, &server->alias);
+        return NGX_CONF_ERROR;
+    }
+
+    if (server->ludpp->lud_filter != NULL
+        && ngx_http_auth_ldap_check_filter(server->ludpp->lud_filter) != NGX_OK)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: the filter \"%s\" in the url of ldap_server \"%V\" is not one parenthesized filter",
+            server->ludpp->lud_filter, &server->alias);
+        return NGX_CONF_ERROR;
+    }
+
     server->url.data = ngx_palloc(cf->pool, ngx_strlen(server->ludpp->lud_scheme) + sizeof("://") - 1 +
         ngx_strlen(server->ludpp->lud_host) + sizeof(":65535"));
     p = ngx_sprintf(server->url.data, "%s://%s:%d%Z", server->ludpp->lud_scheme, server->ludpp->lud_host,
@@ -922,6 +1065,18 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
     ngx_memzero(&server->parsed_url, sizeof(ngx_url_t));
     server->parsed_url.url.data = (u_char *) server->ludpp->lud_host;
     server->parsed_url.url.len = ngx_strlen(server->ludpp->lud_host);
+    if (ngx_strchr(server->ludpp->lud_host, ':') != NULL) {
+        /* IPv6 address: ldap_url_parse() took the brackets off */
+        u_char *h6 = ngx_pnalloc(cf->pool, server->parsed_url.url.len + 3);
+        if (h6 == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        h6[0] = '[';
+        ngx_memcpy(h6 + 1, server->ludpp->lud_host, server->parsed_url.url.len);
+        h6[server->parsed_url.url.len + 1] = ']';
+        server->parsed_url.url.data = h6;
+        server->parsed_url.url.len += 2;
+    }
     server->parsed_url.default_port = server->ludpp->lud_port;
     server->parsed_url.no_resolve = 1; // Do not use hostanme resolution checking during configuration parsing
     if (ngx_parse_url(cf->pool, &server->parsed_url) != NGX_OK) {
@@ -1015,7 +1170,19 @@ ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *se
     ngx_http_compile_complex_value_t ccv;
 
     value = cf->args->elts;
-    //ngx_conf_log_error(NGX_LOG_DEBUG | NGX_LOG_DEBUG_HTTP, cf, 0, "http_auth_ldap: parse_require");
+    if (ngx_strcmp(value[1].data, "valid_user") != 0
+        && ngx_strcmp(value[1].data, "user") != 0
+        && ngx_strcmp(value[1].data, "group") != 0)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: unknown \"require %V\", it must be valid_user, user or group", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+    if (ngx_strcmp(value[1].data, "valid_user") != 0 && cf->args->nelts != 3) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: \"require %V\" takes exactly one argument", &value[1]);
+        return NGX_CONF_ERROR;
+    }
 
     if (ngx_strcmp(value[1].data, "valid_user") == 0) {
         server->require_valid_user = 1;
