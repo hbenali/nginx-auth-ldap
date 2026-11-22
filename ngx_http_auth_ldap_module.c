@@ -1302,7 +1302,12 @@ ngx_http_auth_ldap_check_cache(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
 
     ngx_md5_init(&md5ctx);
     ngx_md5_update(&md5ctx, r->headers_in.user.data, r->headers_in.user.len);
-    ngx_md5_update(&md5ctx, server, offsetof(ngx_http_auth_ldap_server_t, free_connections));
+    /* Hash the stable configuration only. Fields before "alias" (ludpp, url, parsed_url)
+     * change on every connect (parsed_url.addrs is re-resolved), which made the key differ
+     * on every request in stateless mode so the cache never hit. */
+    ngx_md5_update(&md5ctx, (u_char *) server + offsetof(ngx_http_auth_ldap_server_t, alias),
+                   offsetof(ngx_http_auth_ldap_server_t, free_connections)
+                   - offsetof(ngx_http_auth_ldap_server_t, alias));
     ngx_md5_update(&md5ctx, r->headers_in.passwd.data, r->headers_in.passwd.len);
     ngx_md5_final(ctx->cache_big_hash, &md5ctx);
 
