@@ -2,9 +2,12 @@
 
 LDAP module for nginx which supports authentication against multiple LDAP servers.
 
+This is a fork of [Ericbla/nginx-auth-ldap](https://github.com/Ericbla/nginx-auth-ldap) (itself from [kvspb/nginx-auth-ldap](https://github.com/kvspb/nginx-auth-ldap)). It adds stateless mode, custom response headers and LDAPS through nginx's own OpenSSL, and carries the security and robustness fixes of upstream 1.4.0 (see [CHANGELOG.md](CHANGELOG.md)). Current release: **v2.1.0**.
+
 ## Features
 
-- Multiple LDAP server support with failover
+- Multiple LDAP server support with failover (immediate in stateless mode when a server is unreachable)
+- `503` instead of `401` when LDAP cannot answer, and strict `nginx -t` validation of `ldap_server` blocks
 - User/group membership authorization (`require user`, `require group`, `require valid_user`, `satisfy all|any`)
 - LDAP attribute fetching (injected as HTTP headers)
 - **Stateless mode** — connect on-demand, no persistent connections (default)
@@ -12,7 +15,7 @@ LDAP module for nginx which supports authentication against multiple LDAP server
 - **Custom header injection** — `set_auth_header` with nginx variable support
 - Authentication result caching
 - DNS resolver fallback for LDAP hostname resolution
-- LDAPS (TLS) with certificate verification
+- LDAPS (TLS 1.2/1.3) with certificate verification, using the OpenSSL nginx is built with
 - Base64/hex-encoded bind passwords
 
 ## How to install
@@ -26,10 +29,12 @@ Check HTTP_AUTH_LDAP option.
 
 ### Linux
 
+Needs the OpenLDAP client headers (`libldap-dev`, `openldap-devel` or `openldap-dev`). The module does not link a system OpenSSL: for `ldaps://` build nginx with `--with-http_ssl_module`. To keep libldap from loading its own TLS library, link a libldap built `--without-tls` (see [exo-nginx](https://github.com/hbenali/exo-nginx) for an example).
+
 ```bash
-git clone https://github.com/Ericbla/nginx-auth-ldap.git
+git clone --branch v2.1.0 https://github.com/hbenali/nginx-auth-ldap.git
 cd nginx-source
-./configure --add-module=/path/to/nginx-auth-ldap
+./configure --with-http_ssl_module --add-module=/path/to/nginx-auth-ldap
 make install
 ```
 
@@ -280,7 +285,7 @@ Enable or disable LDAP referral following.
 > **Default:** `off`
 
 Verify the remote certificate for LDAPS connections. Requires OpenSSL >= 1.0.2.
-- `on` / `full`: verify chain + hostname
+- `on` / `full`: verify chain + name (a host name in the url against the DNS subjectAltNames, an IP address against the IP ones; never the subject CN)
 - `chain`: verify chain only (skip hostname check)
 - `off`: no verification
 
@@ -320,7 +325,7 @@ All accept nginx time syntax (`s`, `m`, `h`, `d`, etc.):
 |-----------|---------|-------------|
 | `connect_timeout` | `10s` | TCP connect + TLS handshake |
 | `bind_timeout` | `5s` | LDAP bind response wait |
-| `request_timeout` | `10s` | Total auth flow (search + bind + rebind) |
+| `request_timeout` | `10s` | Total auth flow (search + bind + rebind); answers `503` when exceeded |
 | `reconnect_timeout` | `10s` | Delay before reconnection (pool mode) |
 
 ## Behaviour when LDAP cannot answer
