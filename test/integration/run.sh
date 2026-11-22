@@ -48,15 +48,15 @@ scen() {
   t "group filter, login with parens" /vpn "alice)(cn=*:alicepw" "$DENY"
  t "ldaps verify off" /tls_off alice:alicepw 200;   t "ldaps verify off badpw" /tls_off alice:bad "$DENY"
  t "ldaps full + CA" /tls_full alice:alicepw 200;   t "ldaps chain + CA" /tls_chain alice:alicepw 200
- t "ldaps chain, no CA (must fail)" /tls_noca alice:alicepw '000|401|403|500|502|503'
- t "ldaps full wrong hostname (fail)" /tls_badhost alice:alicepw '000|401|403|500|502|503'
- # KNOWN LIMITATION (identical in v1.8): an unreachable first server is not skipped; the request ends after request_timeout
- t "failover: unreachable first server" /failover alice:alicepw '000|50[0-9]'
+ t "ldaps chain, no CA (must fail)" /tls_noca alice:alicepw '401|403|503'
+ t "ldaps full wrong hostname (fail)" /tls_badhost alice:alicepw '401|403|503'
+ # stateless fails over at once; pool mode waits for request_timeout, then answers 503 (known limitation)
+ if [ "$mode" = st ]; then t "failover: unreachable first server" /failover alice:alicepw 200; else t "failover: unreachable first server" /failover alice:alicepw '200|503'; fi
  t "failover: first server denies -> next" /failover_deny alice:alicepw 200
  local h; h=$(docker exec ngt curl -si -u alice:alicepw localhost/valid | tr -d '\r' | grep -i '^x-ldap\|^x-auth' | sort | tr '\n' ' ')
  if [[ "$h" == *"X-Auth-User: alice"* && "$h" == *"X-LDAP-givenName: Alice"* && "$h" == *"X-LDAP-mail: alice@example.org"* ]]; then PASS=$((PASS+1)); echo "  ok   headers: $h"; else FAILN=$((FAILN+1)); echo "  FAIL headers: $h"; fi
  local t0=$(date +%s.%N); local d; d=$(code -u alice:alicepw localhost/dead); local el=$(echo "$(date +%s.%N) - $t0" | bc)
- if [[ "$d" =~ ^(000|50[0-9])$ ]] && (( $(echo "$el < 9" | bc) )); then PASS=$((PASS+1)); echo "  ok   dead server ends in ${el}s (code $d)"; else FAILN=$((FAILN+1)); echo "  FAIL dead server code=$d time=$el"; fi
+ if [[ "$d" == 503 ]] && (( $(echo "$el < 9" | bc) )); then PASS=$((PASS+1)); echo "  ok   dead server ends in ${el}s (code $d)"; else FAILN=$((FAILN+1)); echo "  FAIL dead server code=$d time=$el"; fi
  # injection attempts in username (filter must be escaped)
  t "ldap injection uid=*" /valid '*:x' "$DENY"; t "ldap injection )(uid=*" /valid ')(uid=*:x' "$DENY"; t "ldap injection alice)(|(x=" /valid 'alice)(|(x=:alicepw' "$DENY"
 }
@@ -64,11 +64,11 @@ for mode in st pool; do
   echo "=== MODE $mode, 1 worker"; start $mode 1; scen
   echo "  -- hung LDAP server (docker pause) then recovery"
   docker pause ldapsrv >/dev/null; t0=$(date +%s.%N); g=$(code -u alice:alicepw localhost/valid); el=$(echo "$(date +%s.%N) - $t0" | bc)
-  if [[ "$g" != 200 ]] && (( $(echo "$el < 9" | bc) )); then PASS=$((PASS+1)); echo "  ok   hung server: code $g after ${el}s"; else FAILN=$((FAILN+1)); echo "  FAIL hung server code=$g time=$el"; fi
+  if [[ "$g" == 503 ]] && (( $(echo "$el < 9" | bc) )); then PASS=$((PASS+1)); echo "  ok   hung server: code $g after ${el}s"; else FAILN=$((FAILN+1)); echo "  FAIL hung server code=$g time=$el"; fi
   docker unpause ldapsrv >/dev/null; sleep 1
   t "recovers after unpause (1)" /valid alice:alicepw 200; t "recovers after unpause (2)" /valid alice:alicepw 200; t "recovers: bad pw still denied" /valid alice:bad "$DENY"
   echo "  -- LDAP server down (stop) then up"
-  docker stop ldapsrv >/dev/null; t "server stopped" /valid alice:alicepw '000|50[0-9]|401'; docker start ldapsrv >/dev/null
+  docker stop ldapsrv >/dev/null; t "server stopped" /valid alice:alicepw 503; docker start ldapsrv >/dev/null
   for i in $(seq 40); do docker exec ldapsrv ldapsearch -x -H ldap://localhost -b dc=example,dc=org -D cn=admin,dc=example,dc=org -w admin dn >/dev/null 2>&1 && break; sleep 2; done; sleep 12
   t "recovers after stop/start (1)" /valid alice:alicepw 200; t "recovers after stop/start (2)" /valid alice:alicepw 200
   echo "  crashes: $(docker logs ngt 2>&1 | grep -c 'exited on signal')"
@@ -85,7 +85,7 @@ echo "=== auth cache (stateless and pool): LDAP stopped, cached creds must still
 for mode in st pool; do start $mode 1 cache
   t "[$mode] cache prime alice" /valid alice:alicepw 200; t "[$mode] cache prime bad pw" /valid alice:bad "$DENY"
   docker stop ldapsrv >/dev/null
-  t "[$mode] cached alice, LDAP down" /valid alice:alicepw 200; t "[$mode] bad pw, LDAP down" /valid alice:bad '000|401|403|50[0-9]'; t "[$mode] uncached bob, LDAP down" /valid bob:bobpw '000|401|403|50[0-9]'
+  t "[$mode] cached alice, LDAP down" /valid alice:alicepw 200; t "[$mode] bad pw, LDAP down" /valid alice:bad '401|403|503'; t "[$mode] uncached bob, LDAP down" /valid bob:bobpw 503
   docker start ldapsrv >/dev/null; for i in $(seq 40); do docker exec ldapsrv ldapsearch -x -H ldap://localhost -b dc=example,dc=org -D cn=admin,dc=example,dc=org -w admin dn >/dev/null 2>&1 && break; sleep 2; done; sleep 12
   echo "  crashes: $(docker logs ngt 2>&1 | grep -c 'exited on signal')"
 done
