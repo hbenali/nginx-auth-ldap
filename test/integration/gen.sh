@@ -24,6 +24,8 @@ http {
   ldap_server tls_full  { $(U ldaps://ldap.example.org:636) $(common) require valid_user; ssl_check_cert full; ssl_ca_file /ca.crt; }
   ldap_server tls_chain { $(U ldaps://ldap.example.org:636) $(common) require valid_user; ssl_check_cert chain; ssl_ca_file /ca.crt; }
   ldap_server tls_noca  { $(U ldaps://ldap.example.org:636) $(common) require valid_user; ssl_check_cert chain; }
+  ldap_server tls_ip_full  { $(U ldaps://${LDAPIP:-127.0.0.1}:636) $(common) require valid_user; ssl_check_cert full; ssl_ca_file /ca.crt; }
+  ldap_server tls_ip_chain { $(U ldaps://${LDAPIP:-127.0.0.1}:636) $(common) require valid_user; ssl_check_cert chain; ssl_ca_file /ca.crt; }
   ldap_server tls_badhost { $(U ldaps://ldapsrv:636) $(common) require valid_user; ssl_check_cert full; ssl_ca_file /ca.crt; }
   ldap_server denyfirst { $(U ldap://ldap.example.org:389) $(common) require user "uid=nobody,$B"; }
   ldap_server dead    { $(U ldap://ldap.example.org:3899) $(common) require valid_user; max_down_retries 1; }
@@ -43,6 +45,8 @@ http {
     location /tls_full { auth_ldap "x"; auth_ldap_servers tls_full; proxy_pass http://127.0.0.1:8081; }
     location /tls_chain{ auth_ldap "x"; auth_ldap_servers tls_chain;proxy_pass http://127.0.0.1:8081; }
     location /tls_noca { auth_ldap "x"; auth_ldap_servers tls_noca; proxy_pass http://127.0.0.1:8081; }
+    location /tls_ip_full  { auth_ldap "x"; auth_ldap_servers tls_ip_full;  proxy_pass http://127.0.0.1:8081; }
+    location /tls_ip_chain { auth_ldap "x"; auth_ldap_servers tls_ip_chain; proxy_pass http://127.0.0.1:8081; }
     location /tls_badhost { auth_ldap "x"; auth_ldap_servers tls_badhost; proxy_pass http://127.0.0.1:8081; }
     location /dead     { auth_ldap "x"; auth_ldap_servers dead;    proxy_pass http://127.0.0.1:8081; }
     location /failover_deny { auth_ldap "x"; auth_ldap_servers denyfirst valid; proxy_pass http://127.0.0.1:8081; }

@@ -31,6 +31,7 @@
 #include <ngx_http.h>
 #include <ngx_md5.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 #include <ldap.h>
 #include <openssl/opensslv.h>
 //#include <sys/socket.h>
@@ -1971,40 +1972,52 @@ ngx_http_auth_ldap_ssl_handshake_handler(ngx_connection_t *conn, ngx_flag_t vali
           long chain_verified = SSL_get_verify_result(conn->ssl->connection);
 
           int addr_verified;
-          if (c->server->ssl_check_cert == SSL_CERT_VERIFY_CHAIN) {
+          if (cert == NULL) {
+            // no certificate to check (the verify result alone does not tell)
+            addr_verified = 0;
+          } else if (c->server->ssl_check_cert == SSL_CERT_VERIFY_CHAIN) {
             // chain_verified is enough, not requiring full name/IP verification
             addr_verified = 1;
 
           } else {
-            // verify hostname/IP
+            // verify hostname/IP: an IP address in the url is matched against the IP
+            // subjectAltNames, a host name against the DNS ones, never against the subject CN
             char *hostname = c->server->ludpp->lud_host;
-            addr_verified = X509_check_host(cert, hostname, 0, 0, 0);
+            unsigned char ipbuf[sizeof(struct in6_addr)];
+            if (hostname != NULL && (inet_pton(AF_INET, hostname, ipbuf) == 1
+                                     || inet_pton(AF_INET6, hostname, ipbuf) == 1)) {
+              addr_verified = X509_check_ip_asc(cert, hostname, 0);
+            } else {
+              addr_verified = hostname != NULL
+                  && X509_check_host(cert, hostname, 0, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, 0);
+            }
 
-            if (!addr_verified) { // domain not in cert? try IP
-              size_t len; // get IP length
-
+            if (!addr_verified) { // domain not in cert? try the IP the connection went to
               struct sockaddr *conn_sockaddr = NULL;
               if (conn->sockaddr != NULL) conn_sockaddr = conn->sockaddr;
               else if (c->conn.sockaddr != NULL) conn_sockaddr = c->conn.sockaddr;
               else conn_sockaddr = &c->server->parsed_url.sockaddr.sockaddr;
 
-              if (conn_sockaddr->sa_family == AF_INET) len = 4;
-              else if (conn_sockaddr->sa_family == AF_INET6) len = 16;
-              else { // very unlikely indeed
-                if (cert) X509_free(cert);
-                ngx_http_auth_ldap_close_connection(c, 0);
-                return;
+              // sa_data starts with the port: take the address field of the right family
+              if (conn_sockaddr->sa_family == AF_INET) {
+                addr_verified = X509_check_ip(cert,
+                    (const unsigned char *) &((struct sockaddr_in *) conn_sockaddr)->sin_addr, 4, 0);
+              } else if (conn_sockaddr->sa_family == AF_INET6) {
+                addr_verified = X509_check_ip(cert,
+                    (const unsigned char *) &((struct sockaddr_in6 *) conn_sockaddr)->sin6_addr, 16, 0);
               }
-              addr_verified = X509_check_ip(cert, (const unsigned char*)conn_sockaddr->sa_data, len, 0);
             }
           }
 
           // Find anything fishy?
           if ( !(cert && addr_verified && chain_verified == X509_V_OK) ) {
-            if (!addr_verified) {
+            if (cert == NULL) {
+              ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                "http_auth_ldap: Remote side presented no SSL certificate");
+            } else if (!addr_verified) {
               ngx_log_error(NGX_LOG_ERR, c->log, 0,
                 "http_auth_ldap: Remote side presented invalid SSL certificate: "
-                "does not match address (neither server's domain nor IP in certificate's CN or SAN)");
+                "does not match address (neither server's domain nor IP in certificate's subjectAltName)");
             } else {
               ngx_log_error(NGX_LOG_ERR, c->log, 0,
                 "http_auth_ldap: Remote side presented invalid SSL certificate: error %l, %s",
@@ -2054,6 +2067,19 @@ ngx_http_auth_ldap_ssl_handshake(ngx_http_auth_ldap_connection_t *c)
         ngx_http_auth_ldap_close_connection(c, 0);
         return;
     }
+
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
+    {
+        /* SNI: send the host name of the url, unless it is an IP address */
+        char *host = c->server->ludpp->lud_host;
+        unsigned char ipbuf[sizeof(struct in6_addr)];
+        if (host != NULL && host[0] != '\0' && inet_pton(AF_INET, host, ipbuf) != 1
+            && inet_pton(AF_INET6, host, ipbuf) != 1)
+        {
+            (void) SSL_set_tlsext_host_name(c->conn.connection->ssl->connection, host);
+        }
+    }
+#endif
 
     c->log->action = "SSL handshaking to LDAP server";
     ngx_connection_t *transport = c->conn.connection;

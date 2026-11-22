@@ -23,6 +23,7 @@ docker cp $S/data.ldif ldapsrv:/data.ldif
 docker exec ldapsrv ldapadd -x -H ldap://localhost -D cn=admin,dc=example,dc=org -w admin -f /data.ldif 2>&1 | grep -ci "adding"
 cp $W/pki/ca.crt $W/ca.crt
 start() { # mode workers [cache]
+  export LDAPIP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"ldaptest\").IPAddress}}" ldapsrv)
   docker rm -f ngt >/dev/null 2>&1; $S/gen.sh "$@" > $W/nginx.conf
   docker run -d --name ngt --network ldaptest -v $W/nginx.conf:/etc/nginx/nginx.conf:ro -v $W/ca.crt:/ca.crt:ro --entrypoint nginx $IMG >/dev/null; sleep 3
   [ "$(docker inspect -f '{{.State.Running}}' ngt)" = true ] || { echo "NGINX DID NOT START"; docker logs ngt 2>&1 | tail -3; exit 1; }
@@ -50,6 +51,7 @@ scen() {
  t "ldaps full + CA" /tls_full alice:alicepw 200;   t "ldaps chain + CA" /tls_chain alice:alicepw 200
  t "ldaps chain, no CA (must fail)" /tls_noca alice:alicepw '401|403|503'
  t "ldaps full wrong hostname (fail)" /tls_badhost alice:alicepw '401|403|503'
+ t "ldaps IP url, chain only" /tls_ip_chain alice:alicepw 200; t "ldaps IP url, full (cert has no IP SAN)" /tls_ip_full alice:alicepw 503
  # stateless fails over at once; pool mode waits for request_timeout, then answers 503 (known limitation)
  if [ "$mode" = st ]; then t "failover: unreachable first server" /failover alice:alicepw 200; else t "failover: unreachable first server" /failover alice:alicepw '200|503'; fi
  t "failover: first server denies -> next" /failover_deny alice:alicepw 200
