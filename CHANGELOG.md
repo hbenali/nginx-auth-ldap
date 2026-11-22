@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.1.0] - unreleased
+## [2.1.0] - 2026-11-22
 
 Fixes ported from the revived upstream (kvspb/nginx-auth-ldap 1.x), adapted to this fork's stateless mode.
 
