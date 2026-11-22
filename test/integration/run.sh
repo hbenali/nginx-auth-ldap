@@ -43,6 +43,9 @@ scen() {
  t "require user bob" /onlybob bob:bobpw 200;       t "require user alice(no)" /onlybob alice:alicepw "$DENY"
   t "require user, DN case/spacing differs" /bobdn bob:bobpw 200; t "require user, DN case/spacing, other user" /bobdn alice:alicepw "$DENY"
   t "valid_user DN template" /tpl alice:alicepw 200; t "valid_user DN template bad pw" /tpl alice:bad "$DENY"
+  t "DN template injection (login adds an RDN)" /tpl2 "alice,dc=example:alicepw" "$DENY"
+  t "filter injection: wildcard login" /valid "ali*:alicepw" "$DENY"; t "filter injection: closing paren" /valid "alice)(uid=*:alicepw" "$DENY"
+  t "group filter, login with parens" /vpn "alice)(cn=*:alicepw" "$DENY"
  t "ldaps verify off" /tls_off alice:alicepw 200;   t "ldaps verify off badpw" /tls_off alice:bad "$DENY"
  t "ldaps full + CA" /tls_full alice:alicepw 200;   t "ldaps chain + CA" /tls_chain alice:alicepw 200
  t "ldaps chain, no CA (must fail)" /tls_noca alice:alicepw '000|401|403|500|502|503'

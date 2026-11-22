@@ -19,6 +19,7 @@ http {
   ldap_server onlybob { $(U ldap://ldap.example.org:389) $(common) require user "uid=bob,$B"; }
   ldap_server bobdn   { $(U ldap://ldap.example.org:389) $(common) require user "UID=Bob, DC=Example, dc=org"; }
   ldap_server tpl     { $(U ldap://ldap.example.org:389) $(common) require valid_user "uid=\$remote_user,$B"; }
+  ldap_server tpl2    { $(U ldap://ldap.example.org:389) $(common) require valid_user "uid=\$remote_user,dc=org"; }
   ldap_server tls_off   { $(U ldaps://ldap.example.org:636) $(common) require valid_user; ssl_check_cert off; }
   ldap_server tls_full  { $(U ldaps://ldap.example.org:636) $(common) require valid_user; ssl_check_cert full; ssl_ca_file /ca.crt; }
   ldap_server tls_chain { $(U ldaps://ldap.example.org:636) $(common) require valid_user; ssl_check_cert chain; ssl_ca_file /ca.crt; }
@@ -37,6 +38,7 @@ http {
     location /onlybob  { auth_ldap "x"; auth_ldap_servers onlybob; proxy_pass http://127.0.0.1:8081; }
     location /bobdn    { auth_ldap "x"; auth_ldap_servers bobdn;   proxy_pass http://127.0.0.1:8081; }
     location /tpl      { auth_ldap "x"; auth_ldap_servers tpl;     proxy_pass http://127.0.0.1:8081; }
+    location /tpl2     { auth_ldap "x"; auth_ldap_servers tpl2;    proxy_pass http://127.0.0.1:8081; }
     location /tls_off  { auth_ldap "x"; auth_ldap_servers tls_off;  proxy_pass http://127.0.0.1:8081; }
     location /tls_full { auth_ldap "x"; auth_ldap_servers tls_full; proxy_pass http://127.0.0.1:8081; }
     location /tls_chain{ auth_ldap "x"; auth_ldap_servers tls_chain;proxy_pass http://127.0.0.1:8081; }

@@ -113,6 +113,7 @@ typedef struct {
     ngx_array_t *require_user;      /* array of ngx_http_complex_value_t */
     ngx_flag_t require_valid_user;
     ngx_http_complex_value_t require_valid_user_dn;
+    ngx_uint_t remote_user_index;   /* $remote_user, expanded escaped in the DN template */
     ngx_flag_t satisfy_all;
     ngx_flag_t referral;
     ngx_flag_t clean_on_timeout;
@@ -331,6 +332,9 @@ static void ngx_http_auth_ldap_reconnect_from_connection(ngx_http_auth_ldap_conn
 static void ngx_http_auth_ldap_resolve_handler(ngx_resolver_ctx_t *ctx);
 static ngx_int_t ngx_http_auth_ldap_init_servers(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle);
+static ngx_int_t ngx_http_auth_ldap_escape_filter_value(ngx_pool_t *pool, ngx_str_t *src, ngx_str_t *dst);
+static ngx_int_t ngx_http_auth_ldap_escape_dn_value(ngx_pool_t *pool, ngx_str_t *src, ngx_str_t *dst);
+static ngx_uint_t ngx_http_auth_ldap_dn_special(ngx_str_t *value, size_t i);
 static ngx_int_t ngx_http_auth_ldap_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx,
         ngx_http_auth_ldap_loc_conf_t *conf);
@@ -1040,6 +1044,15 @@ ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *se
     ccv.complex_value = target;
     if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
         return NGX_CONF_ERROR;
+    }
+
+    if (target == &server->require_valid_user_dn) {
+        ngx_str_t remote_user = ngx_string("remote_user");
+        ngx_int_t index = ngx_http_get_variable_index(cf, &remote_user);
+        if (index == NGX_ERROR) {
+            return NGX_CONF_ERROR;
+        }
+        server->remote_user_index = index;
     }
 
     return NGX_CONF_OK;
@@ -2688,6 +2701,125 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
 
 /*** Per-request authentication processing ***/
 
+/*
+ * Escape a value for use inside an LDAP search filter (RFC 4515, section 3):
+ * '*', '(', ')', '\' and NUL become "\XX". The result is NUL-terminated.
+ */
+static ngx_int_t
+ngx_http_auth_ldap_escape_filter_value(ngx_pool_t *pool, ngx_str_t *src, ngx_str_t *dst)
+{
+    static u_char hex[] = "0123456789abcdef";
+    u_char *p, c;
+    size_t i, len;
+
+    len = src->len;
+    for (i = 0; i < src->len; i++) {
+        switch (src->data[i]) {
+        case '*':
+        case '(':
+        case ')':
+        case '\\':
+        case '\0':
+            len += 2;
+            break;
+        default:
+            break;
+        }
+    }
+
+    dst->data = ngx_pnalloc(pool, len + 1);
+    if (dst->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = dst->data;
+    for (i = 0; i < src->len; i++) {
+        c = src->data[i];
+        switch (c) {
+        case '*':
+        case '(':
+        case ')':
+        case '\\':
+        case '\0':
+            *p++ = '\\';
+            *p++ = hex[c >> 4];
+            *p++ = hex[c & 0x0f];
+            break;
+        default:
+            *p++ = c;
+            break;
+        }
+    }
+    *p = '\0';
+    dst->len = len;
+
+    return NGX_OK;
+}
+
+/*
+ * Escape a value for use as an attribute value of an RDN (RFC 4514,
+ * section 2.4): '"', '+', ',', ';', '<', '>', '=' and '\' anywhere, a
+ * leading '#' or space and a trailing space get a backslash. A value with
+ * a NUL cannot be one of a DN passed as a C string: NGX_DECLINED.
+ */
+static ngx_int_t
+ngx_http_auth_ldap_escape_dn_value(ngx_pool_t *pool, ngx_str_t *src, ngx_str_t *dst)
+{
+    u_char *p, c;
+    size_t i, len;
+
+    len = src->len;
+    for (i = 0; i < src->len; i++) {
+        c = src->data[i];
+        if (c == '\0') {
+            return NGX_DECLINED;
+        }
+        if (ngx_http_auth_ldap_dn_special(src, i)) {
+            len++;
+        }
+    }
+
+    dst->data = ngx_pnalloc(pool, len);
+    if (dst->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = dst->data;
+    for (i = 0; i < src->len; i++) {
+        if (ngx_http_auth_ldap_dn_special(src, i)) {
+            *p++ = '\\';
+        }
+        *p++ = src->data[i];
+    }
+    dst->len = len;
+
+    return NGX_OK;
+}
+
+/* Whether byte i of an RDN value needs a backslash (RFC 4514, 2.4). */
+static ngx_uint_t
+ngx_http_auth_ldap_dn_special(ngx_str_t *value, size_t i)
+{
+    switch (value->data[i]) {
+    case '"':
+    case '+':
+    case ',':
+    case ';':
+    case '<':
+    case '>':
+    case '=':
+    case '\\':
+        return 1;
+    case '#':
+        return i == 0;
+    case ' ':
+        return i == 0 || i == value->len - 1;
+    default:
+        return 0;
+    }
+}
+
+
 /**
  * Respond with "403 Forbidden" and add correct headers
  */
@@ -2846,9 +2978,39 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
 
                 if (ctx->server->require_valid_user_dn.value.data != NULL) {
                     /* Construct user DN */
-                    if (ngx_http_complex_value(r, &ctx->server->require_valid_user_dn, &ctx->user_dn) != NGX_OK) {
-                        ngx_del_timer(r->connection->write);
-                        return NGX_ERROR;
+                    {
+                        /* $remote_user expands as the login escaped as an RDN value, so that a
+                         * login cannot add RDNs to the DN (LDAP DN injection). */
+                        ngx_str_t login;
+                        ngx_http_variable_value_t *vv;
+
+                        rc = ngx_http_auth_ldap_escape_dn_value(r->pool, &r->headers_in.user, &login);
+                        if (rc == NGX_DECLINED) {
+                            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                                "http_auth_ldap: login with a NUL byte denied");
+                            ctx->outcome = OUTCOME_DENY;
+                            ctx->phase = PHASE_NEXT;
+                            break;
+                        }
+                        if (rc != NGX_OK) {
+                            ngx_del_timer(r->connection->write);
+                            return NGX_ERROR;
+                        }
+
+                        /* nginx re-reads the Authorization header for $remote_user, so
+                         * preset the cached value and drop it once the DN is built. */
+                        vv = &r->variables[ctx->server->remote_user_index];
+                        vv->len = login.len;
+                        vv->data = login.data;
+                        vv->valid = 1;
+                        vv->not_found = 0;
+                        vv->no_cacheable = 0;
+                        rc = ngx_http_complex_value(r, &ctx->server->require_valid_user_dn, &ctx->user_dn);
+                        vv->valid = 0;
+                        if (rc != NGX_OK) {
+                            ngx_del_timer(r->connection->write);
+                            return NGX_ERROR;
+                        }
                     }
 
                     /* The DN goes to ldap_sasl_bind() as a C string, but a
@@ -3061,6 +3223,7 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
 {
     LDAPURLDesc *ludpp;
     u_char *filter;
+    ngx_str_t login;
     ngx_int_t rc;
 
     /* On the first call, initiate the LDAP search operation */
@@ -3070,13 +3233,22 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
         }
 
         ludpp = ctx->server->ludpp;
+        if (ngx_http_auth_ldap_escape_filter_value(r->pool, &r->headers_in.user, &login) != NGX_OK) {
+            ngx_http_auth_ldap_return_connection(ctx->c);
+            return NGX_ERROR;
+        }
+
         filter = ngx_pcalloc(
             r->pool,
             (ludpp->lud_filter != NULL ? ngx_strlen(ludpp->lud_filter) : ngx_strlen("(objectClass=*)")) +
-            ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + r->headers_in.user.len + 1);
+            ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + login.len + 1);
+        if (filter == NULL) {
+            ngx_http_auth_ldap_return_connection(ctx->c);
+            return NGX_ERROR;
+        }
         ngx_sprintf(filter, "(&%s(%s=%V))%Z",
                 ludpp->lud_filter != NULL ? ludpp->lud_filter : "(objectClass=*)",
-                ludpp->lud_attrs[0], &r->headers_in.user);
+                ludpp->lud_attrs[0], &login);
         ngx_log_error(NGX_LOG_INFO, ctx->c->log, 0, "ngx_http_auth_ldap_search: Cnx[%d] Searching (with filter \"%s\") ...",
             ctx->c->cnx_idx, (const char *) filter);
 
@@ -3282,18 +3454,15 @@ ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
     tail_gr++;
     cn_gr = gr;
 
-    if (ctx->server->group_attribute_dn == 1) {
-        user_val = ngx_pcalloc(
-            r->pool,
-            ctx->user_dn.len + 1);
-        ngx_memcpy(user_val, ctx->user_dn.data, ctx->user_dn.len);
-        user_val[ctx->user_dn.len] = '\0';
-    } else {
-        user_val = ngx_pcalloc(
-            r->pool,
-            r->headers_in.user.len + 1);
-        ngx_memcpy(user_val, r->headers_in.user.data, r->headers_in.user.len);
-        user_val[r->headers_in.user.len] = '\0';
+    {
+        ngx_str_t esc;
+        if (ngx_http_auth_ldap_escape_filter_value(r->pool,
+                ctx->server->group_attribute_dn == 1 ? &ctx->user_dn : &r->headers_in.user, &esc) != NGX_OK) {
+            ctx->outcome = OUTCOME_ERROR;
+            ngx_http_auth_ldap_return_connection(ctx->c);
+            return NGX_ERROR;
+        }
+        user_val = (char *) esc.data;
     }
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search user in group \"%V\"", &val);
